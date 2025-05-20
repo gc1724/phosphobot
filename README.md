@@ -133,6 +133,55 @@ Some of the ways you can contribute:
 - Improve the documentation and tutorials
 - Contribute to the code
 
+If you'd like to modify Phosphobot locally (e.g. to fix a bug), you can install it from your own fork using `pip install -e .`. Here's how:
+
+1. Fork the repository
+ 
+Go to the phosphobot GitHub repo and click Fork to create your own copy.
+
+Clone your fork:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/phosphobot.git
+cd phosphobot
+```
+
+2. Create a virtual environment (recommended)
+   
+We recommend creating a fresh virtual environment using conda or venv:
+
+- Option A: Conda
+    ```bash
+    conda create -n phosphobot-env python=3.11 -y
+    conda activate phosphobot-env
+    ```
+- Option B: venv
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    ```
+
+3. Install phosphobot in editable mode
+
+Install all dependencies and make it editable:
+```bash
+pip install -e '.[dev]'  # if a dev extra is defined
+# or fallback:
+pip install -e .
+pip install -r requirements.txt  # if needed
+```
+You can now modify files in the phosphobot/ folder and test changes immediately without reinstalling.
+
+4. Run locally
+Start the server locally:
+```bash
+phosphobot run
+```
+Or run directly via Python:
+```bash
+python -m phosphobot
+```
+
 ## Support
 
 - **Documentation**: Read the [documentation](https://docs.phospho.ai)
