@@ -81,10 +81,6 @@ export default function AIControlPage() {
     ([endpoint]) => fetcher(endpoint, "POST"),
   );
 
-  supabase.auth.setSession({
-    access_token: session?.access_token || "",
-    refresh_token: session?.refresh_token || "",
-  });
 
   const { data: serverStatus, mutate: mutateServerStatus } =
     useSWR<ServerStatus>(["/status"], fetcher);

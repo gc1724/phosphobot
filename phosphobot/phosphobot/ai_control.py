@@ -14,7 +14,6 @@ from phosphobot.camera import AllCameras
 from phosphobot.hardware.base import BaseRobot
 from phosphobot.utils import get_tokens
 from phosphobot.models import ServerInfoResponse
-from phosphobot.supabase import get_client
 
 
 class CustomAIControlSignal(AIControlSignal):
