@@ -1,34 +1,36 @@
-from abc import ABC, abstractmethod
 import asyncio
+import json
+import os
 import pickle
 import time
+import traceback
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Tuple
+
 import cv2
 import numpy as np
 import zmq
-import traceback
 from fastapi import HTTPException
+from huggingface_hub import HfApi, snapshot_download
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
-from pathlib import Path
-import os
-from huggingface_hub import HfApi, snapshot_download
-import json
 
-from phosphobot.am.base import ActionModel, BaseTrainer
-from phosphobot.camera import AllCameras
-from phosphobot.control_signal import AIControlSignal
-from phosphobot.models.dataset import BaseRobot
-from phosphobot.utils import background_task_log_exceptions, get_hf_token
 from phosphobot.am.base import (
+    ActionModel,
+    BaseTrainer,
+    BaseTrainerConfig,
     HuggingFaceTokenValidator,
+    TrainingParamsGr00T,
     generate_readme,
     resize_dataset,
-    BaseTrainerConfig,
-    TrainingParamsGr00T,
 )
+from phosphobot.camera import AllCameras
+from phosphobot.control_signal import AIControlSignal
+from phosphobot.hardware.base import BaseManipulator
+from phosphobot.utils import background_task_log_exceptions, get_hf_token
 
 # Code from: https://github.com/NVIDIA/Isaac-GR00T/blob/main/gr00t/eval/service.py#L111
 
@@ -137,7 +139,7 @@ class BaseInferenceServer:
                         "status": "error",
                         "error_type": type(e).__name__,
                         "message": str(e),
-                        # omit traceback if you don’t want to expose internals
+                        # omit traceback if you don't want to expose internals
                         "traceback": tb,
                     }
                     self.socket.send(TorchSerializer.to_bytes(error_resp))
@@ -256,7 +258,7 @@ class BaseInferenceClient:
                 raise RuntimeError(f"{et}: {msg}\n\n{tb}")
             return resp.get("result", {})
         else:
-            # legacy: the handler’s own dict
+            # legacy: the handler's own dict
             return resp
 
     def __del__(self):
@@ -612,7 +614,7 @@ class Gr00tN1(ActionModel):
         cls,
         model_id: str,
         all_cameras: AllCameras,
-        robots: list[BaseRobot],
+        robots: list[BaseManipulator],
         cameras_keys_mapping: Dict[str, int] | None = None,
     ) -> Gr00tSpawnConfig:
         """
@@ -684,7 +686,7 @@ class Gr00tN1(ActionModel):
     async def control_loop(
         self,
         control_signal: AIControlSignal,
-        robots: list[BaseRobot],
+        robots: list[BaseManipulator],
         model_spawn_config: Gr00tSpawnConfig,
         all_cameras: AllCameras,
         prompt: str | None = None,
@@ -736,7 +738,7 @@ class Gr00tN1(ActionModel):
                     image = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
                     # Add a batch dimension (from (240, 320, 3) to (1, 240, 320, 3))
                     converted_array = np.expand_dims(image, axis=0)
-                    # Ensure dtype is uint8 (if it isn’t already)
+                    # Ensure dtype is uint8 (if it isn't already)
                     converted_array = converted_array.astype(np.uint8)
                     image_inputs[f"video.{camera_name}"] = converted_array
 
@@ -770,10 +772,10 @@ class Gr00tN1(ActionModel):
                 raise Exception("No robot connected. Exiting AI control loop.")
 
             # Concatenate all robot states
-            state = robots[0].current_position(unit="rad")
+            state = robots[0].read_joints_position(unit="rad")
             for robot in robots[1:]:
                 state = np.concatenate(
-                    (state, robot.current_position(unit="rad")), axis=0
+                    (state, robot.read_joints_position(unit="rad")), axis=0
                 )
             if model_spawn_config.unit == "degrees":
                 state = np.deg2rad(state)
@@ -817,6 +819,16 @@ class Gr00tN1(ActionModel):
                 # Send the new joint position to the robot
                 action_list = action.tolist()
                 for robot_index in range(len(robots)):
+                    # If the action are all -pi in rad or -180 in degrees, skip
+                    if all(
+                        np.isclose(
+                            action_list[robot_index * 6 : robot_index * 6 + 6],
+                            -np.pi if model_spawn_config.unit == "rad" else -180,
+                        )
+                    ):
+                        logger.warning("All predicted actions are -pi. Skipping.")
+                        continue
+
                     robots[robot_index].write_joint_positions(
                         angles=action_list[robot_index * 6 : robot_index * 6 + 6],
                         unit=model_spawn_config.unit,
@@ -896,6 +908,7 @@ async def run_gr00t_training(
     number_of_cameras,
     learning_rate,
     wandb_enabled: bool,
+    validation_data_dir=None,
     timeout_seconds: int | None = None,
     gr00t_repo_path: str = ".",
 ):
@@ -904,34 +917,49 @@ async def run_gr00t_training(
         f"{gr00t_repo_path}/scripts/gr00t_finetune.py",
         "--dataset-path",
         str(data_dir),
-        # Only 1 GPU for now
-        # Open an issue for multi-GPU support
-        "--num-gpus",
-        "1",
-        "--output-dir",
-        str(output_dir),
-        "--batch-size",
-        str(batch_size),
-        "--num-epochs",
-        str(epochs),
-        "--save-steps",
-        "10000",
-        "--num-arms",
-        str(number_of_robots),
-        "--num-cams",
-        str(number_of_cameras),
-        "--learning_rate",
-        str(learning_rate),
-        "--report_to",
-        "wandb" if wandb_enabled else "tensorboard",
-        "--video_backend",
-        "torchvision_av",
     ]
+
+    if validation_data_dir is not None:
+        logger.info(f"Using validation dataset from {validation_data_dir}")
+        cmd.extend(["--validation-dataset-path", str(validation_data_dir)])
+    else:
+        logger.info("No validation dataset provided. No validation will be done.")
+
+    # Add remaining arguments
+    cmd.extend(
+        [
+            # Only 1 GPU for now
+            # Open an issue for multi-GPU support
+            "--num-gpus",
+            "1",
+            "--output-dir",
+            str(output_dir),
+            "--batch-size",
+            str(batch_size),
+            "--num-epochs",
+            str(epochs),
+            "--save-steps",
+            "10000",
+            "--num-arms",
+            str(number_of_robots),
+            "--num-cams",
+            str(number_of_cameras),
+            "--learning_rate",
+            str(learning_rate),
+            "--report_to",
+            "wandb" if wandb_enabled else "tensorboard",
+            "--video_backend",
+            "torchvision_av",
+        ]
+    )
 
     logger.info(f"Starting training with command: {' '.join(cmd)}")
 
     process = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        limit=1024 * 128,  # 128 KB buffer size, default is 64 but seems to be too small
     )
 
     output_lines = []
@@ -955,7 +983,7 @@ async def run_gr00t_training(
         await process.wait()
         logger.error(f"Training process timed out after {timeout_seconds} seconds.")
         raise TimeoutError(
-            f"Training process exceeded timeout of {timeout_seconds} seconds. Please consider lowering the number of epochs or batch size."
+            f"Training process exceeded timeout of {timeout_seconds} seconds. Please consider lowering the number of epochs and/or batch size."
         )
 
     await process.wait()
@@ -1048,6 +1076,56 @@ class Gr00tTrainer(BaseTrainer):
         logger.info("Generating modality.json file")
         number_of_robots, number_of_cameras = generate_modality_json(data_dir)
 
+        val_data_dir: Path | None = None
+        if self.config.training_params.validation_dataset_name is not None:
+            if self.config.training_params.validation_data_dir is not None:
+                val_data_dir = Path(self.config.training_params.validation_data_dir)
+            # It can be None if the user has not provided a validation dataset
+            else:
+                val_data_dir = Path("validation_data/")
+
+            os.makedirs(val_data_dir, exist_ok=True)
+            for attempt in range(max_retries):
+                try:
+                    dataset_path_val_str = snapshot_download(
+                        repo_id=self.config.training_params.validation_dataset_name,
+                        repo_type="dataset",
+                        revision=selected_branch,
+                        local_dir=str(val_data_dir),
+                        token=os.getenv("HF_TOKEN"),
+                    )
+                    VAL_DATASET_PATH = Path(dataset_path_val_str)
+                    logger.info(
+                        f"Validation dataset {self.config.training_params.validation_dataset_name} downloaded to {VAL_DATASET_PATH}"
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                    else:
+                        raise RuntimeError(
+                            f"Failed to download dataset {self.config.training_params.validation_dataset_name} after {max_retries} attempts, is Hugging Face down ? : {e}"
+                        )
+
+            resized_successful, _ = resize_dataset(
+                dataset_root_path=VAL_DATASET_PATH, resize_to=(224, 224)
+            )
+            if not resized_successful:
+                raise RuntimeError(
+                    f"Resizing dataset {self.config.training_params.validation_dataset_name} to 224x224 failed: {resized_successful}"
+                )
+            logger.info(
+                f"Resized dataset {self.config.training_params.validation_dataset_name} to 224x224"
+            )
+            logger.info("Generating modality.json file for validation dataset")
+            generate_modality_json(val_data_dir)
+
+        else:
+            logger.info("No validation dataset provided. No validation will be done.")
+            # We set the validation data dir to None to avoid passing it to the training script
+            val_data_dir = None
+
         # Find the total number of frames in the dataset in meta / info.json
         with open(data_dir / "meta" / "info.json", "r") as f:
             info = json.load(f)
@@ -1074,6 +1152,7 @@ class Gr00tTrainer(BaseTrainer):
                 number_of_cameras=number_of_cameras,
                 learning_rate=self.config.training_params.learning_rate,
                 wandb_enabled=self.config.wandb_api_key is not None,
+                validation_data_dir=val_data_dir,
                 timeout_seconds=timeout_seconds,
                 gr00t_repo_path=self.config.training_params.path_to_gr00t_repo,
             )

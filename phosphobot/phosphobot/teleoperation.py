@@ -11,9 +11,10 @@ from fastapi import WebSocket
 from loguru import logger
 from pydantic import ValidationError
 
-from phosphobot.hardware import BaseRobot
+from phosphobot.hardware import BaseRobot, BaseManipulator
 from phosphobot.models import AppControlData, RobotStatus, UDPServerInformationResponse
 from phosphobot.robot import RobotConnectionManager
+from phosphobot.utils import get_local_network_ip
 
 
 @dataclass
@@ -30,7 +31,7 @@ class TeleopManager:
     action_counter: int
     last_report: datetime
     MOVE_TIMEOUT: float = 1.0  # seconds
-    MAX_INSTRUCTIONS_PER_SEC: int = 120
+    MAX_INSTRUCTIONS_PER_SEC: int = 200
 
     def __init__(self, rcm: RobotConnectionManager, robot_id: int | None = None):
         self.rcm = rcm
@@ -58,43 +59,46 @@ class TeleopManager:
             return True
         return False
 
-    def get_robot(self, source: str) -> Optional[BaseRobot]:
+    async def get_robot(self, source: str) -> Optional[BaseRobot]:
         """Get the appropriate robot based on source"""
         if self.robot_id is not None:
-            return self.rcm.get_robot(self.robot_id)
+            return await self.rcm.get_robot(self.robot_id)
 
         # Otherwise, use the source
         if source == "right":
-            return self.rcm.robots[0]
-        elif source == "left" and len(self.rcm.robots) > 1:
-            return self.rcm.robots[1]
+            return (await self.rcm.robots)[0]
+        elif source == "left" and len(await self.rcm.robots) > 1:
+            return (await self.rcm.robots)[1]
 
         return None
 
-    async def move_init(self):
+    async def move_init(self, robot_id: int | None = None) -> None:
         """
         Move the robot to the initial position.
         """
-        for robot in self.rcm.robots:
+        for i, robot in enumerate(await self.rcm.robots):
+            if robot_id is not None and i != robot_id:
+                continue
             robot.init_config()
             robot.enable_torque()
             # For Agilex Piper, we need to connect after enabling torque
             if robot.name == "agilex-piper":
                 robot.connect()
-            zero_position = np.zeros(len(robot.SERVO_IDS))
-            robot.set_motors_positions(zero_position)
+            await robot.move_to_initial_position()
 
         # Hard block the code to wait for the robot to reach the initial position
-        if any(robot.name == "agilex-piper" for robot in self.rcm.robots):
+        if any(robot.name == "agilex-piper" for robot in (await self.rcm.robots)):
             await asyncio.sleep(2.5)
         else:
             await asyncio.sleep(0.5)
 
-        for robot in self.rcm.robots:
-            initial_position, initial_orientation_rad = robot.forward_kinematics()
-
-            robot.initial_effector_position = initial_position
-            robot.initial_effector_orientation_rad = initial_orientation_rad
+        for i, robot in enumerate(await self.rcm.robots):
+            if robot_id is not None and i != robot_id:
+                continue
+            if hasattr(robot, "forward_kinematics"):
+                initial_position, initial_orientation_rad = robot.forward_kinematics()
+                robot.initial_position = initial_position
+                robot.initial_orientation_rad = initial_orientation_rad
 
     async def process_control_data(self, control_data: AppControlData) -> bool:
         """Process control data and return if it was processed"""
@@ -107,28 +111,26 @@ class TeleopManager:
 
             state.last_timestamp = control_data.timestamp
 
-        robot = self.get_robot(control_data.source)
+        robot = await self.get_robot(control_data.source)
         if not robot:
             return False
 
         # Initialize robot if needed
-        if (
-            robot.initial_effector_position is None
-            or robot.initial_effector_orientation_rad is None
-        ):
-            await self.move_init()
+        if isinstance(robot, BaseManipulator):
+            if robot.initial_position is None or robot.initial_orientation_rad is None:
+                await self.move_init()
 
-        # Convert and execute command
-        (
-            target_pos,
-            target_orient_deg,
-            target_open,
-        ) = control_data.to_robot(robot_name=robot.name)
+            # Convert and execute command
+            (
+                target_pos,
+                target_orient_deg,
+                target_open,
+            ) = control_data.to_robot(robot_name=robot.name)
 
         target_orientation_rad = (
-            np.deg2rad(target_orient_deg) + robot.initial_effector_orientation_rad
+            np.deg2rad(target_orient_deg) + robot.initial_orientation_rad
         )
-        target_position = robot.initial_effector_position + target_pos
+        target_position = robot.initial_position + target_pos
 
         # if robot.is_moving, wait for it to stop
         start_wait_time = time.perf_counter()
@@ -138,17 +140,10 @@ class TeleopManager:
         ):
             await asyncio.sleep(0.0001)
 
-        loop = asyncio.get_event_loop()
         try:
             # off-load blocking move_robot into threadpool + enforce timeout
             await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    robot.move_robot,
-                    target_position,
-                    target_orientation_rad,
-                    False,  # interpolate_trajectory
-                ),
+                robot.move_robot_absolute(target_position, target_orientation_rad),
                 timeout=self.MOVE_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -158,8 +153,9 @@ class TeleopManager:
             # skip gripper & counting if move failed
             return False
 
-        robot.control_gripper(open_command=target_open)
-        robot.update_object_gripping_status()
+        if isinstance(robot, BaseManipulator):
+            robot.control_gripper(open_command=target_open)
+            robot.update_object_gripping_status()
 
         self.action_counter += 1
         return True
@@ -172,17 +168,19 @@ class TeleopManager:
         now = datetime.now()
 
         for source, state in self.states.items():
-            robot = self.get_robot(source)
+            robot = await self.get_robot(source)
             if robot and (now - state.last_update).total_seconds() > 0.033:
-                if state.gripped != robot.is_object_gripped:
-                    state.gripped = robot.is_object_gripped
-                    updates.append(
-                        RobotStatus(
-                            is_object_gripped=state.gripped,
-                            is_object_gripped_source=source,
-                            nb_actions_received=self.action_counter,
+                if isinstance(robot, BaseManipulator):
+                    if state.gripped != robot.is_object_gripped:
+                        state.gripped = robot.is_object_gripped
+                        updates.append(
+                            RobotStatus(
+                                is_object_gripped=state.gripped,
+                                is_object_gripped_source=source,
+                                nb_actions_received=self.action_counter,
+                            )
                         )
-                    )
+
                 state.last_update = now
 
         # Send periodic action count
@@ -287,6 +285,7 @@ class UDPServer:
             return UDPServerInformationResponse(host=host, port=bound_port)
 
         loop = asyncio.get_running_loop()
+        local_ip = get_local_network_ip()
 
         # choose port
         if port is None:
@@ -294,12 +293,12 @@ class UDPServer:
                 try:
                     transport, protocol = await loop.create_datagram_endpoint(
                         lambda: _TeleopProtocol(self.manager),
-                        local_addr=("0.0.0.0", p),
+                        local_addr=(local_ip, p),
                     )
                     self.transport = transport
                     self.protocol = protocol
                     self.bound_port = p
-                    logger.info(f"Bound UDP server to 0.0.0.0:{p}")
+                    logger.info(f"Bound UDP server to {local_ip}:{p}")
                     break
                 except OSError:
                     continue
@@ -308,12 +307,12 @@ class UDPServer:
         else:
             transport, protocol = await loop.create_datagram_endpoint(
                 lambda: _TeleopProtocol(self.manager),
-                local_addr=("0.0.0.0", port),
+                local_addr=(local_ip, port),
             )
             self.transport = transport
             self.protocol = protocol
             self.bound_port = port
-            logger.info(f"Bound UDP server to 0.0.0.0:{port}")
+            logger.info(f"Bound UDP server to {local_ip}:{port}")
 
         host, bound_port = self.transport.get_extra_info("sockname")
         return UDPServerInformationResponse(host=host, port=bound_port)

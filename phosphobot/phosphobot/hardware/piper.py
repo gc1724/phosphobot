@@ -9,11 +9,11 @@ from phosphobot.models import BaseRobotConfig
 from piper_sdk import C_PiperInterface_V2
 
 
-from phosphobot.hardware.base import BaseRobot
+from phosphobot.hardware.base import BaseManipulator
 from phosphobot.utils import is_running_on_linux, get_resources_path
 
 
-class PiperHardware(BaseRobot):
+class PiperHardware(BaseManipulator):
     name = "agilex-piper"
 
     URDF_FILE_PATH = str(
@@ -94,7 +94,7 @@ class PiperHardware(BaseRobot):
             logger.warning(e)
             return None
 
-    def connect(self):
+    async def connect(self):
         """
         Setup the robot.
         can_number : 0 if only one robot is connected, 1 to connec to second robot
@@ -229,7 +229,7 @@ class PiperHardware(BaseRobot):
         Each position is mapped to an angle.
         """
         # Get current position
-        current_position = self.current_position(unit="motor_units", source="sim")
+        current_position = self.read_joints_position(unit="motor_units", source="sim")
         # Write the new position
         current_position[servo_id - 1] = units
 
@@ -316,7 +316,7 @@ class PiperHardware(BaseRobot):
         position_deg = self.RESOLUTION * radians / (2 * np.pi)
         return position_deg.astype(int)
 
-    def calibrate(self) -> tuple[Literal["success", "in_progress", "error"], str]:
+    async def calibrate(self) -> tuple[Literal["success", "in_progress", "error"], str]:
         """
         This is called during the calibration phase of the robot.
         CAUTION :

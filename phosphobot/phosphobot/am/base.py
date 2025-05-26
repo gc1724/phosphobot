@@ -1,15 +1,20 @@
-import av
 import random
 import string
-import requests  # type: ignore
-import numpy as np
+from abc import ABC, abstractmethod
 from pathlib import Path
-from loguru import logger
-from huggingface_hub import HfApi
-from abc import abstractmethod, ABC
 from typing import Literal, Optional
-from phosphobot.models import InfoModel
+
+import av
+import numpy as np
+import requests  # type: ignore
+from huggingface_hub import HfApi
+from loguru import logger
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from phosphobot.models import InfoModel
+
+# Disable PyAV logs
+av.logging.set_level(None)
 
 
 class ActionModel(ABC):
@@ -102,6 +107,11 @@ class TrainingParamsGr00T(BaseModel):
         gt=0,
         le=1,
     )
+    validation_dataset_name: str | None = Field(
+        default=None,
+        description="Optional dataset repository ID on Hugging Face to use for validation",
+    )
+
     batch_size: int | None = Field(
         default=None,
         description="Batch size for training, default is 64, decrease it if you get an out of memory error",
@@ -125,6 +135,11 @@ class TrainingParamsGr00T(BaseModel):
         default="data/", description="The directory to save the dataset to"
     )
 
+    validation_data_dir: str | None = Field(
+        default=None,
+        description="Optional directory to save the validation dataset to. If None, no validation will be done.",
+    )
+
     output_dir: str = Field(
         default="outputs/", description="The directory to save the model to"
     )
@@ -139,7 +154,7 @@ class TrainingParamsGr00T(BaseModel):
 
 
 class BaseTrainerConfig(BaseModel):
-    model_type: Literal["ACT", "gr00t"] = Field(
+    model_type: Literal["ACT", "gr00t", "custom"] = Field(
         ...,
         description="Type of model to train, either 'ACT' or 'gr00t'",
     )
@@ -147,6 +162,7 @@ class BaseTrainerConfig(BaseModel):
         ...,
         description="Dataset repository ID on Hugging Face, should be a public dataset",
     )
+
     model_name: Optional[str] = Field(
         default=None,
         description="Name of the trained model to upload to Hugging Face, should be in the format phospho-app/<model_name> or <model_name>",
@@ -385,9 +401,9 @@ def resize_dataset(
                             codec_name="h264",
                             rate=input_stream.base_rate,
                         )
-                        output_stream.width = resize_to[0]
-                        output_stream.height = resize_to[1]
-                        output_stream.pix_fmt = input_stream.pix_fmt
+                        output_stream.width = resize_to[0]  # type: ignore
+                        output_stream.height = resize_to[1]  # type: ignore
+                        output_stream.pix_fmt = input_stream.pix_fmt  # type: ignore
 
                         # Process frames
                         for frame in input_container.decode(video=0):
@@ -398,11 +414,11 @@ def resize_dataset(
                             )
 
                             # Encode frame
-                            packet = output_stream.encode(frame)
+                            packet = output_stream.encode(frame)  # type: ignore
                             output_container.mux(packet)
 
                         # Flush encoder
-                        for value in output_stream.encode(None):
+                        for value in output_stream.encode(None):  # type: ignore
                             output_container.mux(value)
 
                         input_container.close()

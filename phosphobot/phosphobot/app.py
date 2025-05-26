@@ -1,4 +1,3 @@
-import asyncio
 import platform
 import socket
 from contextlib import asynccontextmanager
@@ -169,7 +168,7 @@ async def status(
         leader_follower_control,
     )
 
-    robots = rcm.robots
+    robots = await rcm.robots
 
     robot_names = [robot.name for robot in robots]
 
@@ -177,7 +176,7 @@ async def status(
         status="ok",
         name=platform.uname().node,  # Name of the machine
         robots=robot_names,
-        robot_status=rcm.status(),
+        robot_status=await rcm.status(),
         cameras=cameras.status(),
         is_recording=recorder.is_recording,
         ai_running_status=ai_control_signal.status,
@@ -190,10 +189,10 @@ async def status(
 app.include_router(control_router)
 app.include_router(camera_router)
 app.include_router(recording_router)
+app.include_router(training_router)
 app.include_router(pages_router)
 app.include_router(networking_router)
 app.include_router(update_router)
-app.include_router(training_router)
 app.include_router(auth_router)
 
 # TODO : Only allow secured origins

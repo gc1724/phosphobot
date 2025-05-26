@@ -15,21 +15,16 @@ from dynamixel_sdk import (
 from loguru import logger
 from serial.tools.list_ports_common import ListPortInfo
 
-from phosphobot.hardware.base import BaseRobot
+from phosphobot.hardware.base import BaseManipulator
 from phosphobot.utils import get_resources_path
 
 
-class KochHardware(BaseRobot):
+class KochHardware(BaseManipulator):
     name: str = "koch-v1.1"
 
     URDF_FILE_PATH = str(get_resources_path() / "urdf" / "koch" / "robot.urdf")
 
-    DEVICE_PID = 21971
-
     AXIS_ORIENTATION = [0, 0, 1, -1]
-
-    # Shipped phospho models have these serial numbers
-    REGISTERED_SERIAL_ID: list[str] = ["58CD176940"]
 
     TORQUE_ENABLE = 1  # Value to enable torque
     TORQUE_DISABLE = 0  # Value to disable torque
@@ -72,16 +67,13 @@ class KochHardware(BaseRobot):
         """
         Detect if the device is a Koch v1.1 robot.
         """
-        if (
-            port.pid == cls.DEVICE_PID
-            and port.serial_number in cls.REGISTERED_SERIAL_ID
-        ):
+        if port.pid == 21971 and port.serial_number in {"58CD176940"}:
             return cls(device_name=port.device, serial_id=port.serial_number)
         return None
 
-    def connect(self):
+    async def connect(self):
         # Initialize PortHandler and PacketHandler
-        self.portHandler = PortHandler(self.DEVICE_NAME)
+        self.portHandler = PortHandler(self.device_name)
         self.packetHandler = PacketHandler(protocol_version=2.0)
 
         # Open port
@@ -146,20 +138,20 @@ class KochHardware(BaseRobot):
 
         # Convert PID values to bytes and add to GroupSyncWrite
         successD = all(
-            [
-                groupSyncWriteD.addParam(servo_id, [DXL_LOBYTE(d), DXL_HIBYTE(d)])
+            [  # type: ignore
+                groupSyncWriteD.addParam(servo_id, [DXL_LOBYTE(d), DXL_HIBYTE(d)])  # type: ignore
                 for servo_id, (d, _, _) in zip(self.SERVO_IDS, pid_params)
             ]
         )
         successI = all(
-            [
-                groupSyncWriteI.addParam(servo_id, [DXL_LOBYTE(i), DXL_HIBYTE(i)])
+            [  # type: ignore
+                groupSyncWriteI.addParam(servo_id, [DXL_LOBYTE(i), DXL_HIBYTE(i)])  # type: ignore
                 for servo_id, (_, i, _) in zip(self.SERVO_IDS, pid_params)
             ]
         )
         successP = all(
-            [
-                groupSyncWriteP.addParam(servo_id, [DXL_LOBYTE(p), DXL_HIBYTE(p)])
+            [  # type: ignore
+                groupSyncWriteP.addParam(servo_id, [DXL_LOBYTE(p), DXL_HIBYTE(p)])  # type: ignore
                 for servo_id, (_, _, p) in zip(self.SERVO_IDS, pid_params)
             ]
         )

@@ -1,7 +1,7 @@
 import asyncio
-from functools import lru_cache
 import os
 import time
+from functools import lru_cache
 from typing import Literal, Optional, cast
 
 import numpy as np
@@ -10,8 +10,8 @@ from loguru import logger
 
 from phosphobot.camera import AllCameras, get_all_cameras
 from phosphobot.configs import config
+from phosphobot.hardware import BaseRobot
 from phosphobot.models import (
-    BaseRobot,
     Dataset,
     Episode,
     EpisodesModel,
@@ -529,8 +529,7 @@ class Recorder:
             step_count += 1
 
 
-@lru_cache()
-def get_recorder(
+async def get_recorder(
     rcm: RobotConnectionManager = Depends(get_rcm),
 ) -> Recorder:
     """
@@ -541,7 +540,7 @@ def get_recorder(
     if recorder is not None:
         return recorder
     else:
-        robots = rcm.robots
+        robots = await rcm.robots
         cameras = get_all_cameras()
         recorder = Recorder(
             robots=robots,  # type: ignore

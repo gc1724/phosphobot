@@ -1,6 +1,8 @@
-import base64
 import os
 import cv2
+import random
+import base64
+import traceback
 from pathlib import Path, PurePath
 from typing import Literal, cast
 
@@ -9,7 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from huggingface_hub import HfApi
 from loguru import logger
 
-from phosphobot.am.base import ActionModel
+from phosphobot.am.base import ActionModel, TrainingRequest
 from phosphobot.configs import config
 from phosphobot.models import (
     AdminSettingsRequest,
@@ -19,7 +21,11 @@ from phosphobot.models import (
     BrowserFilesRequest,
     Dataset,
     DatasetListResponse,
+    DatasetRepairRequest,
+    DatasetShuffleRequest,
+    DatasetSplitRequest,
     DeleteEpisodeRequest,
+    HFDownloadDatasetRequest,
     HuggingFaceTokenRequest,
     InfoResponse,
     MergeDatasetsRequest,
@@ -27,11 +33,15 @@ from phosphobot.models import (
     ModelVideoKeysRequest,
     ModelVideoKeysResponse,
     StatusResponse,
+    TrainingInfoRequest,
+    TrainingInfoResponse,
     VizSettingsResponse,
     WandBTokenRequest,
     InfoModel,
 )
+from phosphobot.models.dataset import EpisodesModel
 from phosphobot.utils import (
+    get_hf_token,
     get_resources_path,
     get_home_app_path,
     is_running_on_pi,
@@ -45,7 +55,7 @@ router = APIRouter(tags=["pages"])
 
 # Root directory for the file browser
 ROOT_DIR = str(get_home_app_path() / "recordings")
-INDEX_PATH = str(get_resources_path() / "dist" / "index.html")
+INDEX_PATH = get_resources_path() / "dist" / "index.html"
 
 
 # Optionally, if you want the dashboard to be served at the root endpoint:
@@ -67,7 +77,7 @@ INDEX_PATH = str(get_resources_path() / "dist" / "index.html")
 @router.get("/inference", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def serve_dashboard(request: Request):
-    with open(INDEX_PATH, "r") as f:
+    with open(INDEX_PATH.resolve(), "r") as f:
         content = f.read()
     return HTMLResponse(content=content)
 
@@ -491,6 +501,12 @@ async def merge_datasets(merge_request: MergeDatasetsRequest):
                 detail="The datasets have different video sizes.",
             )
 
+    if first_info.fps != second_info.fps:
+        raise HTTPException(
+            status_code=400,
+            detail="The datasets have different FPS.",
+        )
+
     if (
         first_info.robot_type != second_info.robot_type
         or first_info.codebase_version != second_info.codebase_version
@@ -498,7 +514,6 @@ async def merge_datasets(merge_request: MergeDatasetsRequest):
         != second_info.total_videos // second_info.total_episodes
         or first_info.features.observation_state.shape[0]
         != second_info.features.observation_state.shape[0]
-        or first_info.fps != second_info.fps
     ):
         raise HTTPException(
             status_code=400,
@@ -592,6 +607,13 @@ async def delete_episode(query: DeleteEpisodeRequest):
             detail="The dataset was not found or the dataset name is incorrect",
         )
 
+    if "lerobot_v2" in query.path:
+        # The stats model delete_episode method is not implemented, will probably never be
+        raise HTTPException(
+            status_code=400,
+            detail="This feature is not available for v2 datasets. Please use the v2.1 dataset format.",
+        )
+
     # Delete the data file
     dataset.delete_episode(episode_id=query.episode_id, update_hub=True)
     return StatusResponse(status="ok")
@@ -656,3 +678,280 @@ async def get_model_video_keys(
     except Exception as e:
         logger.warning(f"No video keys found for {request.model_id}: {e}")
         return ModelVideoKeysResponse(video_keys=[])
+
+
+@router.post("/training/info", response_model=TrainingInfoResponse)
+async def get_training_info(
+    request: TrainingInfoRequest,
+) -> TrainingInfoResponse:
+    """
+    Fetch the info.json from the model repo and return the training info.
+    """
+    if request.model_type == "custom":
+        return TrainingInfoResponse(
+            status="ok",
+            training_body={
+                "custom_command": "python absolute/path/to/file.py --epochs 10"
+            },
+        )
+
+    try:
+        token_path = str(get_home_app_path()) + "/huggingface.token"
+
+        if not os.path.exists(token_path):
+            raise HTTPException(
+                status_code=400,
+                detail="Hugging Face token not found. Please set the token in the Admin page.",
+            )
+
+        with open(token_path, "r") as token_file:
+            token = token_file.read().strip()
+        api = HfApi(token=token)
+        user_info = api.whoami(token=token)
+        username_or_orgid = parse_hf_username_or_orgid(user_info)
+
+        model_info = api.hf_hub_download(
+            repo_id=request.model_id,
+            repo_type="dataset",
+            filename="meta/info.json",
+            token=token,
+        )
+
+        meta_folder_path = os.path.dirname(model_info)
+        validated_info = InfoModel.from_json(meta_folder_path=meta_folder_path)
+
+        number_of_cameras = validated_info.total_videos // validated_info.total_episodes
+        training_params = {}
+        if number_of_cameras > 0:
+            if request.model_type == "gr00t":
+                training_params["batch_size"] = (
+                    110 // number_of_cameras - 3 * number_of_cameras
+                )
+            elif request.model_type == "ACT":
+                training_params["batch_size"] = 120 // number_of_cameras
+                training_params["steps"] = 8_000
+
+        # These are heuristics used to determine the training parameters
+        random_suffix = "".join(
+            random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)
+        )
+        training_response = TrainingRequest(
+            model_type=request.model_type,
+            dataset_name=request.model_id,
+            model_name=f"phospho-app/{username_or_orgid}-{request.model_type}-{request.model_id.split('/')[1]}-{random_suffix}",
+        )
+        # Replace the fields in training_response with the values from training_params dict
+        if training_response.training_params is not None:
+            for key, value in training_params.items():
+                if hasattr(training_response.training_params, key):
+                    setattr(training_response.training_params, key, value)
+
+        return TrainingInfoResponse(
+            status="ok",
+            training_body=training_response.model_dump(
+                exclude={
+                    "wandb_api_key": True,
+                    "custom_command": True,
+                    "training_params": {
+                        "path_to_gr00t_repo": True,
+                        "data_dir": True,
+                        "output_dir": True,
+                    },
+                }
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"Error fetching training info: {e}")
+        return TrainingInfoResponse(
+            status="error",
+            message=f"Error fetching training info: {e}",
+        )
+
+
+@router.post("/dataset/hf_download")
+async def hf_download_dataset(
+    query: HFDownloadDatasetRequest,
+) -> StatusResponse:
+    if os.path.exists(os.path.join(ROOT_DIR, "lerobot_v2.1", query.dataset_name)):
+        return StatusResponse(
+            status="error",
+            message=f"Dataset {query.dataset_name} already exists.",
+        )
+
+    token = get_hf_token()
+    if token is None:
+        return StatusResponse(
+            status="error",
+            message="Hugging Face token not found. Please set the token in the Admin page.",
+        )
+
+    # Check if the dataset exists
+    try:
+        api = HfApi(token=token)
+        info_file_path = api.hf_hub_download(
+            repo_id=query.dataset_name,
+            repo_type="dataset",
+            filename="meta/info.json",
+            force_download=True,
+        )
+        validated_info_model = InfoModel.from_json(
+            meta_folder_path=os.path.dirname(info_file_path)
+        )
+        if validated_info_model.codebase_version != "v2.1":
+            # Do not allow downloading a dataset that is not in the v2.1 format
+            # This is to prevent issues loading the stats file if the dataset comes from lerobot
+            # As sum and square_sum will not be present
+            return StatusResponse(
+                status="error",
+                message=(
+                    f"Dataset {query.dataset_name} is not in v2.1 format and is not compatible with this version of the app."
+                ),
+            )
+
+        dataset_name = query.dataset_name.split("/")[-1]
+
+        api.snapshot_download(
+            repo_id=query.dataset_name,
+            repo_type="dataset",
+            local_dir=os.path.join(ROOT_DIR, "lerobot_v2.1", dataset_name),
+            ignore_patterns=[".git", ".gitignore"],
+            force_download=True,
+        )
+
+        return StatusResponse(
+            status="ok",
+        )
+    except Exception:
+        error_message = traceback.format_exc()
+        # When HF fails, it just fails with read error log
+        # So we check it and return a more user friendly error
+        if "404 Client Error" in error_message:
+            return StatusResponse(
+                status="error",
+                message=f"Dataset {query.dataset_name} not found on Hugging Face.",
+            )
+        else:
+            logger.warning(
+                f"Error downloading dataset {query.dataset_name}: {error_message}"
+            )
+            return StatusResponse(
+                status="error",
+                message="Error downloading dataset, please check the logs",
+            )
+
+
+@router.post("/dataset/repair", response_model=StatusResponse)
+async def repair_dataset(query: DatasetRepairRequest):
+    """
+    Repair a dataset by removing any corrupted files.
+    For now, this only works for parquets files.
+    If the parquets are wrongly indexed, it will not do anything.
+    """
+    dataset_path = os.path.join(ROOT_DIR, query.dataset_path)
+    # Check if the path exists and is a directory
+    if not os.path.exists(dataset_path) or not os.path.isdir(dataset_path):
+        raise HTTPException(
+            status_code=404, detail=f"Dataset {query.dataset_path} not found"
+        )
+
+    # For the moment, we repair parquets files only, we need to improve this function to recaculate the meta files as well
+
+    result = EpisodesModel.repair_parquets(
+        parquets_path=os.path.join(dataset_path, "data", "chunk-000"),
+    )
+
+    if result:
+        return StatusResponse(status="ok")
+    else:
+        return StatusResponse(
+            status="error", message="Please check the logs for more details."
+        )
+
+
+@router.post("/dataset/split", response_model=StatusResponse)
+async def split_dataset(query: DatasetSplitRequest):
+    """
+    Split a dataset into two datasets.
+    Used for creating training and validation datasets.
+    """
+    dataset_path = os.path.join(ROOT_DIR, query.dataset_path)
+    # Check if the path exists and is a directory
+    if not os.path.exists(dataset_path) or not os.path.isdir(dataset_path):
+        return StatusResponse(
+            status="error", message=f"Dataset {query.dataset_path} not found"
+        )
+
+    datatype = query.dataset_path.split("/")[0]
+    if datatype != "lerobot_v2.1":
+        return StatusResponse(
+            status="error",
+            message="You can only split datasets of type v2.1",
+        )
+
+    # Split the dataset
+    dataset = Dataset(path=dataset_path)
+
+    try:
+        dataset.split_dataset(
+            split_ratio=query.split_ratio,
+            first_split_name=query.first_split_name,
+            second_split_name=query.second_split_name,
+        )
+    except Exception as e:
+        logger.warning(f"Error splitting dataset: {e}")
+        return StatusResponse(
+            status="error",
+            message=f"Error splitting dataset: {e}",
+        )
+    return StatusResponse(status="ok", message="Dataset split successfully")
+
+
+@router.post("/dataset/shuffle", response_model=StatusResponse)
+async def shuffle_dataset(query: DatasetShuffleRequest):
+    """
+    Shuffle a dataset in place.
+    """
+    dataset_path = os.path.join(ROOT_DIR, query.dataset_path)
+    # Check if the path exists and is a directory
+    if not os.path.exists(dataset_path) or not os.path.isdir(dataset_path):
+        return StatusResponse(
+            status="error", message=f"Dataset {query.dataset_path} not found"
+        )
+
+    datatype = query.dataset_path.split("/")[0]
+    if datatype != "lerobot_v2.1":
+        return StatusResponse(
+            status="error",
+            message="You can only shuffle datasets of type v2.1",
+        )
+
+    # Shuffle the dataset
+    dataset = Dataset(path=dataset_path)
+
+    # Name of the new dataset after shuffling
+    new_dataset_name = f"{query.dataset_path}_shuffled"
+    while os.path.exists(os.path.join(ROOT_DIR, new_dataset_name)):
+        # Find if a int suffix is already present
+        if new_dataset_name.endswith("_shuffled"):
+            # If it ends with _shuffled, we can add a number
+            new_dataset_name += "_1"
+        else:
+            # Otherwise, parse the int and increment it
+            try:
+                suffix = int(new_dataset_name.split("_")[-1])
+                new_dataset_name = (
+                    "_".join(new_dataset_name.split("_")[:-1]) + f"_{suffix + 1}"
+                )
+            except ValueError:
+                # If the suffix is not an int, we just add _1
+                new_dataset_name += "_1"
+
+    try:
+        dataset.shuffle_dataset(new_dataset_name=new_dataset_name)
+    except Exception as e:
+        logger.warning(f"Error shuffling dataset: {e}")
+        return StatusResponse(
+            status="error",
+            message=f"Error shuffling dataset: {e}",
+        )
+    return StatusResponse(status="ok", message="Dataset shuffled successfully")

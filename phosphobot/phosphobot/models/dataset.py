@@ -4,12 +4,11 @@ import json
 import os
 import shutil
 import time
-from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, Union, cast
+from typing import Dict, List, Literal, Optional, Tuple, cast
 
 import numpy as np
-import pandas as pd  # type: ignore
+import pandas as pd
 from huggingface_hub import (
     HfApi,
     create_branch,
@@ -20,7 +19,13 @@ from huggingface_hub import (
     upload_folder,
 )
 from loguru import logger
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from phosphobot.types import VideoCodecs
 from phosphobot.utils import (
@@ -35,169 +40,9 @@ from phosphobot.utils import (
     get_home_app_path,
     parse_hf_username_or_orgid,
 )
+from phosphobot.models.robot import BaseRobot
 
 DEFAULT_FILE_ENCODING = "utf-8"
-
-
-class BaseRobotPIDGains(BaseModel):
-    """
-    PID gains for servo motors
-    """
-
-    p_gain: float
-    i_gain: float
-    d_gain: float
-
-
-class BaseRobotConfig(BaseModel):
-    """
-    Calibration configuration for a robot
-    """
-
-    name: str
-    servos_voltage: float
-    servos_offsets: List[float] = Field(
-        default_factory=lambda: [
-            2048.0,
-            2048.0,
-            2048.0,
-            2048.0,
-            2048.0,
-            2048.0,
-        ]
-    )
-    # Default factory: default offsets for SO-100
-    servos_calibration_position: List[float]
-    servos_offsets_signs: List[float] = Field(
-        default_factory=lambda: [-1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    )
-    pid_gains: List[BaseRobotPIDGains] = Field(default_factory=list)
-
-    # Torque value to consider that an object is gripped
-    gripping_threshold: int = 0
-    non_gripping_threshold: int = 0  # noise
-
-    @classmethod
-    def from_json(cls, filepath: str) -> Union["BaseRobotConfig", None]:
-        """
-        Load a configuration from a JSON file
-        """
-        try:
-            with open(filepath, "r", encoding=DEFAULT_FILE_ENCODING) as f:
-                data = json.load(f)
-
-        except FileNotFoundError:
-            return None
-
-        # Fix issues with the JSON file
-        servos_offsets = data.get("servos_offsets", [])
-        if len(servos_offsets) == 0:
-            data["servos_offsets"] = [2048.0] * 6
-
-        servos_offsets_signs = data.get("servos_offsets_signs", [])
-        if len(servos_offsets_signs) == 0:
-            data["servos_offsets_signs"] = [-1.0] + [1.0] * 5
-
-        try:
-            return cls(**data)
-        except Exception as e:
-            logger.error(f"Error loading configuration from {filepath}: {e}")
-            return None
-
-    @classmethod
-    def from_serial_id(
-        cls, serial_id: str, name: str
-    ) -> Union["BaseRobotConfig", None]:
-        """
-        Load a configuration from a serial ID and a name.
-        """
-        filename = f"{name}_{serial_id}_config.json"
-        filepath = str(get_home_app_path() / "calibration" / filename)
-        return cls.from_json(filepath)
-
-    def to_json(self, filename: str) -> None:
-        """
-        Save the configuration to a JSON file
-        """
-        with open(filename, "w", encoding=DEFAULT_FILE_ENCODING) as f:
-            f.write(self.model_dump_json(indent=4))
-
-    def save_local(self, serial_id: str) -> str:
-        """
-        Save the configuration to the local calibration folder
-
-        Returns:
-            The path to the saved file
-        """
-        filename = f"{self.name}_{serial_id}_config.json"
-        filepath = str(get_home_app_path() / "calibration" / filename)
-        logger.info(f"Saving configuration to {filepath}")
-        self.to_json(filepath)
-        return filepath
-
-
-class BaseRobot(ABC):
-    name: str
-
-    @abstractmethod
-    def set_motors_positions(
-        self, positions: np.ndarray, enable_gripper: bool = False
-    ) -> None:
-        """
-        Set the motor positions of the robot
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def write_joint_positions(
-        self, angles: np.ndarray, unit: Literal["rad", "motor_units", "degrees"] = "rad"
-    ) -> None:
-        """
-        Write the joint positions of the robot
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def current_position(
-        self, unit: Literal["rad", "motor_units", "degrees"] = "rad"
-    ) -> np.ndarray:
-        """
-        Get the current position of the robot
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_info(self) -> "BaseRobotInfo":
-        """
-        Get information about the robot
-        Dict returned is info.json file at initialization
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def control_gripper(self, position: float) -> None:
-        """
-        Control the gripper of the robot
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Get the observation of the robot.
-
-        This method should return the observation of the robot.
-        Will be used to build an observation in a Step of an episode.
-
-        Returns:
-            - state: np.array state of the robot (7D)
-            - joints_position: np.array joints position of the robot
-        """
-        raise NotImplementedError
-
-
-class BaseCamera(ABC):
-    camera_type: str
 
 
 class Observation(BaseModel):
@@ -1189,7 +1034,9 @@ class Dataset:
                     old_index = int(filename.split("_")[-1].split(".")[0])
                     old_index_to_new_index[old_index] = current_new_index_max
                     current_new_index_max += 1
-        current_new_index_max = max(old_index_to_new_index.values()) + 1
+            current_new_index_max = max(old_index_to_new_index.values()) + 1
+        else:
+            current_new_index_max = 0
 
         logger.debug(f"old_index_to_new_index: {old_index_to_new_index}")
 
@@ -1221,6 +1068,9 @@ class Dataset:
                     # Use the mapping to update the episode index
                     df["episode_index"] = df["episode_index"].replace(
                         old_index_to_new_index
+                    )
+                    logger.debug(
+                        f"Updating episode index in {new_filename}: {df['episode_index']}"
                     )
                     # Replace the global index (total number of steps in the dataset)
                     # First, make it from zero to the total number of rows
@@ -1256,6 +1106,11 @@ class Dataset:
             self.get_episode_data_path(episode_id), format=self.episode_format
         )
         # Get the full path to the data with episode id
+
+        if self.episode_format == "lerobot_v2.0":
+            raise NotImplementedError(
+                "Episode deletion is not implemented for LeRobot v2.0 format. Please use v2.1 format."
+            )
 
         if self.check_repo_exists(self.repo_id) is False:
             logger.warning(
@@ -1324,7 +1179,7 @@ class Dataset:
             for camera_folder_full_path in self.get_camera_folders_full_paths():
                 self.reindex_episodes(
                     folder_path=camera_folder_full_path,
-                    old_index_to_new_index=old_index_to_new_index,
+                    old_index_to_new_index=old_index_to_new_index,  # type: ignore
                 )
 
             episodes_model.update_for_episode_removal(
@@ -1344,7 +1199,7 @@ class Dataset:
                 episodes_stats_model.save(meta_folder_path=self.meta_folder_full_path)
                 logger.info("Episodes stats model updated")
             elif info_model.codebase_version == "v2.0":
-                # Update the stats model for v2.0
+                # Update for episode removal is not implemented
                 stats_model.update_for_episode_removal(
                     data_folder_path=self.data_folder_full_path,
                 )
@@ -1459,6 +1314,30 @@ class Dataset:
 
         return np.mean(episode_fps)
 
+    def generate_read_me_string(self, dataset_name: str) -> str:
+        """
+        Generate a README string for the dataset.
+        This is used to create the README file in the dataset folder.
+        """
+        return f"""
+---
+tags:
+- phosphobot
+- so100
+- phospho-dk
+task_categories:
+- robotics                                                   
+---
+
+# {dataset_name}
+
+**This dataset was generated using a [phospho starter pack](https://robots.phospho.ai).**
+
+This dataset contains a series of episodes recorded with a robot and multiple cameras. \
+It can be directly used to train a policy using imitation learning. \
+It's compatible with LeRobot and RLDS.
+"""
+
     def push_dataset_to_hub(self, branch_path: str | None = None):
         """
         Push the dataset to the Hugging Face Hub.
@@ -1481,7 +1360,6 @@ class Dataset:
                     return
 
             except Exception as e:
-                logger.error(f"Error getting user info: {e}")
                 logger.warning(
                     "No user or org with write access found. Won't be able to push to Hugging Face."
                 )
@@ -1493,24 +1371,7 @@ class Dataset:
                 with open(
                     readme_path, "w", encoding=DEFAULT_FILE_ENCODING
                 ) as readme_file:
-                    readme_file.write(f"""
----
-tags:
-- phosphobot
-- so100
-- phospho-dk
-task_categories:
-- robotics                                                   
----
-
-# {self.dataset_name}
-
-**This dataset was generated using a [phospho starter pack](https://robots.phospho.ai).**
-
-This dataset contains a series of episodes recorded with a robot and multiple cameras. \
-It can be directly used to train a policy using imitation learning. \
-It's compatible with LeRobot and RLDS.
-""")
+                    readme_file.write(self.generate_read_me_string(self.dataset_name))
 
             # Construct full repo name
             dataset_repo_name = f"{username_or_org_id}/{self.dataset_name}"
@@ -1608,7 +1469,7 @@ It's compatible with LeRobot and RLDS.
                     logger.error(f"Error handling custom branch: {e}")
 
         except Exception as e:
-            logger.error(f"An error occurred: {e}")
+            logger.warning(f"An error occurred: {e}")
 
     def merge_datasets(
         self,
@@ -1823,6 +1684,512 @@ It's compatible with LeRobot and RLDS.
                     os.path.join(path_to_data, new_parquet_file),
                 )
 
+        # Create README file
+        logger.debug("Creating README file")
+        readme_path = os.path.join(path_result_dataset, "README.md")
+        if not os.path.exists(readme_path):
+            with open(readme_path, "w", encoding=DEFAULT_FILE_ENCODING) as readme_file:
+                readme_file.write(self.generate_read_me_string(new_dataset_name))
+
+        logger.info(f"Dataset {new_dataset_name} created successfully")
+
+    def split_dataset(
+        self, split_ratio: float, first_split_name: str, second_split_name: str
+    ) -> None:
+        """
+        Split the dataset into two parts based on a given ratio.
+        This will create two new datasets with the split data.
+        The first dataset will contain split ratio of the original dataset,
+        split_ratio should be between 0 and 1
+
+        Note: This method is intended to work for v2.1 format only.
+
+        Dataset Structure
+
+        / videos
+            ├── chunk-000
+            │   ├── observation.images.main
+            │   |   ├── episode_000000.mp4
+            │   ├── observation.images.secondary_0
+            │   |   ├── episode_000000.mp4
+        / data
+            ├── chunk-000
+            │   ├── episode_000000.parquet
+        / meta
+            ├── info.json
+            ├── tasks.jsonl
+            ├── episodes.jsonl
+            ├── episodes_stats.jsonl
+        / README.md
+        """
+        if split_ratio <= 0 or split_ratio >= 1:
+            raise ValueError(f"Split ratio {split_ratio} should be between 0 and 1")
+
+        first_dataset_path = os.path.join(
+            os.path.dirname(self.folder_full_path),
+            first_split_name,
+        )
+        second_split_name_path = os.path.join(
+            os.path.dirname(self.folder_full_path),
+            second_split_name,
+        )
+        # If the dataset already exists, raise an error
+        if os.path.exists(first_dataset_path):
+            raise ValueError(
+                f"Dataset {first_split_name} already exists in {first_dataset_path}"
+            )
+        if os.path.exists(second_split_name_path):
+            raise ValueError(
+                f"Dataset {second_split_name} already exists in {second_split_name_path}"
+            )
+        os.makedirs(first_dataset_path, exist_ok=True)
+        os.makedirs(second_split_name_path, exist_ok=True)
+
+        ### Find number of episodes
+
+        path_to_data = os.path.join(
+            self.folder_full_path,
+            "data",
+            "chunk-000",
+        )
+        nbr_of_episodes = len(
+            [
+                f
+                for f in os.listdir(path_to_data)
+                if f.endswith(".parquet") and f.startswith("episode_")
+            ]
+        )
+
+        first_dataset_number_of_episodes = int(nbr_of_episodes * split_ratio)
+        second_dataset_number_of_episodes = (
+            nbr_of_episodes - first_dataset_number_of_episodes
+        )
+        logger.debug(
+            f"Splitting dataset {self.dataset_name} into {first_split_name}: {first_dataset_number_of_episodes} and {second_split_name}: {second_dataset_number_of_episodes}"
+        )
+
+        ### VIDEOS
+        logger.debug("Spliting videos")
+        first_dataset_videos_path = os.path.join(
+            first_dataset_path,
+            "videos",
+            "chunk-000",
+        )
+        os.makedirs(first_dataset_videos_path, exist_ok=True)
+        second_dataset_videos_path = os.path.join(
+            second_split_name_path,
+            "videos",
+            "chunk-000",
+        )
+        os.makedirs(second_dataset_videos_path, exist_ok=True)
+
+        # Grab videos and move them
+        for video_folder in os.listdir(self.videos_folder_full_path):
+            if "image" in video_folder:
+                # find all videos and sort them by name
+                video_folder_full_path = os.path.join(
+                    self.videos_folder_full_path, video_folder
+                )
+                video_files = [
+                    f for f in os.listdir(video_folder_full_path) if f.endswith(".mp4")
+                ]
+                video_files.sort()
+                # Split the videos into two parts
+                first_dataset_video_files = video_files[
+                    :first_dataset_number_of_episodes
+                ]
+                second_dataset_video_files = video_files[
+                    first_dataset_number_of_episodes : first_dataset_number_of_episodes
+                    + second_dataset_number_of_episodes
+                ]
+                # Move the video filed to the new dataset and rename the second ones
+                os.makedirs(
+                    os.path.join(first_dataset_videos_path, video_folder),
+                    exist_ok=True,
+                )
+                for video_file in first_dataset_video_files:
+                    # Move the video file to the new dataset
+                    shutil.copy(
+                        os.path.join(video_folder_full_path, video_file),
+                        os.path.join(
+                            first_dataset_videos_path,
+                            video_folder,
+                            video_file,
+                        ),
+                    )
+
+                os.makedirs(
+                    os.path.join(second_dataset_videos_path, video_folder),
+                    exist_ok=True,
+                )
+                for video_file in second_dataset_video_files:
+                    # Get the index of the video
+                    video_index = (
+                        int(video_file.split("_")[-1].split(".")[0])
+                        - first_dataset_number_of_episodes
+                    )
+                    # Rename the video file
+                    new_video_file = f"episode_{video_index:06d}.mp4"
+                    # Move the video file to the new dataset
+                    shutil.copy(
+                        os.path.join(video_folder_full_path, video_file),
+                        os.path.join(
+                            second_dataset_videos_path,
+                            video_folder,
+                            new_video_file,
+                        ),
+                    )
+
+        ### META FILES
+        logger.debug("Creating meta files")
+        first_meta_folder_path = os.path.join(first_dataset_path, "meta")
+        second_meta_folder_path = os.path.join(second_split_name_path, "meta")
+        os.makedirs(first_meta_folder_path, exist_ok=True)
+        os.makedirs(second_meta_folder_path, exist_ok=True)
+
+        #### episodes.jsonl
+        logger.debug("Creating episodes.jsonl")
+
+        initial_episodes = EpisodesModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        first_episodes_model, second_episodes_model = initial_episodes.split(
+            split_ratio=split_ratio
+        )
+        first_episodes_model.save(
+            meta_folder_path=first_meta_folder_path,
+            save_mode="overwrite",
+        )
+        second_episodes_model.save(
+            meta_folder_path=second_meta_folder_path,
+            save_mode="overwrite",
+        )
+
+        #### episodes_stats.jsonl
+        logger.debug("Creating episodes_stats.jsonl")
+
+        initial_stats = EpisodesStatsModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path
+        )
+        first_episodes_stats_model, second_episodes_stats_model = initial_stats.split(
+            split_ratio=split_ratio,
+        )
+        first_episodes_stats_model.save(
+            meta_folder_path=first_meta_folder_path,
+        )
+        second_episodes_stats_model.save(
+            meta_folder_path=second_meta_folder_path,
+        )
+
+        #### tasks.jsonl
+        logger.debug("Creating tasks.jsonl")
+
+        initial_tasks = TasksModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path
+        )
+        # Reload episodes to make sure we haven't modified them
+        initial_episodes = EpisodesModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        (
+            first_tasks,
+            second_tasks,
+            first_dataset_number_of_tasks,
+            second_dataset_number_of_tasks,
+            old_task_mapping_to_new,
+        ) = initial_tasks.split(
+            split_ratio=split_ratio, initial_episodes_model=initial_episodes
+        )
+        first_tasks.save(
+            meta_folder_path=first_meta_folder_path,
+        )
+        second_tasks.save(
+            meta_folder_path=second_meta_folder_path,
+        )
+
+        ### PARQUET FILES
+        logger.debug("Spliting parquet files")
+
+        first_dataset_data_path = os.path.join(
+            first_dataset_path,
+            "data",
+            "chunk-000",
+        )
+        os.makedirs(first_dataset_data_path, exist_ok=True)
+        second_dataset_data_path = os.path.join(
+            second_split_name_path,
+            "data",
+            "chunk-000",
+        )
+        os.makedirs(second_dataset_data_path, exist_ok=True)
+
+        # Move the parquet files to the new dataset and rename them
+        # List and sort all parquets
+
+        parquet_files = [
+            f
+            for f in os.listdir(self.data_folder_full_path)
+            if f.endswith(".parquet") and f.startswith("episode_")
+        ]
+        parquet_files.sort()
+
+        index_in_second_dataset = 0
+        for parquet_file in parquet_files:
+            # Get the index of the parquet file
+            parquet_index = int(parquet_file.split("_")[-1].split(".")[0])
+            # Rename the parquet file
+            new_parquet_file = f"episode_{parquet_index:06d}.parquet"
+            # Move the parquet file to the new dataset
+            if parquet_index < first_dataset_number_of_episodes:
+                shutil.copy(
+                    os.path.join(path_to_data, parquet_file),
+                    os.path.join(first_dataset_data_path, new_parquet_file),
+                )
+            else:
+                # Rename the parquet file
+                new_parquet_file = f"episode_{parquet_index - first_dataset_number_of_episodes:06d}.parquet"
+                shutil.copy(
+                    os.path.join(path_to_data, parquet_file),
+                    os.path.join(second_dataset_data_path, new_parquet_file),
+                )
+                # Load parquet file
+                df = pd.read_parquet(
+                    os.path.join(second_dataset_data_path, new_parquet_file),
+                )
+                # Update the episode index in the parquet file
+                df["episode_index"] = (
+                    df["episode_index"] - first_dataset_number_of_episodes
+                )
+                # Update the index in the parquet file
+                df["index"] = np.arange(len(df)) + index_in_second_dataset
+                # Update the task index in the parquet file
+                df["task_index"] = df["task_index"].replace(
+                    old_task_mapping_to_new,
+                )
+                index_in_second_dataset += len(df)
+                # Save the parquet file
+                df.to_parquet(
+                    os.path.join(second_dataset_data_path, new_parquet_file),
+                )
+
+        #### info.json
+        # We create the info files last, because we need info from the other files
+        logger.debug("Creating info.json")
+
+        initial_info = InfoModel.from_json(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        number_of_cameras = initial_info.total_videos // initial_info.total_episodes
+
+        first_info = InfoModel.from_json(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        first_info.total_episodes = first_dataset_number_of_episodes
+        first_info.total_frames = initial_info.total_frames - index_in_second_dataset
+        first_info.total_tasks = first_dataset_number_of_tasks
+        first_info.splits = {
+            "train": f"0:{first_dataset_number_of_episodes}",
+        }
+        first_info.total_videos = first_dataset_number_of_episodes * number_of_cameras
+
+        second_info = InfoModel.from_json(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        second_info.total_episodes = second_dataset_number_of_episodes
+        second_info.total_frames = index_in_second_dataset
+        second_info.total_tasks = second_dataset_number_of_tasks
+        second_info.splits = {
+            "train": f"{0}:{second_dataset_number_of_episodes}",
+        }
+        second_info.total_videos = second_dataset_number_of_episodes * number_of_cameras
+        first_info.save(
+            meta_folder_path=first_meta_folder_path,
+        )
+        second_info.save(
+            meta_folder_path=second_meta_folder_path,
+        )
+
+        #### Create README.md files
+        logger.debug("Creating README.md files")
+
+        first_readme_path = os.path.join(first_dataset_path, "README.md")
+        if not os.path.exists(first_readme_path):
+            with open(
+                first_readme_path,
+                "w",
+                encoding=DEFAULT_FILE_ENCODING,
+            ) as readme_file:
+                readme_file.write(self.generate_read_me_string(first_split_name))
+        second_readme_path = os.path.join(second_split_name_path, "README.md")
+        if not os.path.exists(second_readme_path):
+            with open(
+                second_readme_path,
+                "w",
+                encoding=DEFAULT_FILE_ENCODING,
+            ) as readme_file:
+                readme_file.write(self.generate_read_me_string(second_split_name))
+
+        logger.info(
+            f"Dataset {self.dataset_name} split into {first_split_name} and {second_split_name} successfully"
+        )
+
+    def shuffle_dataset(self, new_dataset_name) -> None:
+        """
+        Shuffle the episodes in the dataset.
+        Expects a dataset in v2.1 format.
+        This will pick a random shuffle of the episodes and apply it to the videos, data and meta files.
+        """
+        if self.episode_format != "lerobot_v2.1":
+            raise ValueError(
+                f"Dataset {self.dataset_name} is not in v2.1 format, cannot shuffle"
+            )
+
+        # Create a new dataset folder in the parent folder of the current dataset
+        new_dataset_path = os.path.join(
+            os.path.dirname(os.path.dirname(self.folder_full_path)),
+            new_dataset_name,
+        )
+
+        # If the dataset already exists, raise an error
+        if os.path.exists(new_dataset_path):
+            raise ValueError(
+                f"Dataset {new_dataset_name} already exists in {new_dataset_path}"
+            )
+
+        # Find the number of episodes in the dataset
+        logger.info("Shuffling the dataset episodes")
+        path_to_data = self.data_folder_full_path
+        parquet_files = [
+            f
+            for f in os.listdir(path_to_data)
+            if f.endswith(".parquet") and f.startswith("episode_")
+        ]
+        if not parquet_files:
+            raise ValueError(
+                f"No parquet files found in {path_to_data}. Is this a valid dataset?"
+            )
+        number_of_episodes = len(parquet_files)
+        shuffle = np.random.permutation(number_of_episodes)
+
+        ### Data
+        logger.debug("Shuffling data files")
+        os.makedirs(os.path.join(new_dataset_path, "data", "chunk-000"), exist_ok=True)
+
+        for parquet_file in parquet_files:
+            # Get the index of the parquet file
+            parquet_index = int(parquet_file.split("_")[-1].split(".")[0])
+            # Rename the parquet file
+            new_parquet_file = f"episode_{shuffle[parquet_index]:06d}.parquet"
+            # Move the parquet file to the new dataset
+            shutil.copy(
+                os.path.join(path_to_data, parquet_file),
+                os.path.join(new_dataset_path, "data", "chunk-000", new_parquet_file),
+            )
+
+        # Repair datasets
+        old_to_new = {k: int(v) for k, v in enumerate(shuffle)}
+        self.reindex_episodes(
+            folder_path=new_dataset_path, old_index_to_new_index=old_to_new
+        )
+
+        ### Videos
+
+        logger.debug("Shuffling video files")
+        path_to_videos = os.path.join(new_dataset_path, "videos", "chunk-000")
+        os.makedirs(path_to_videos, exist_ok=True)
+
+        for video_folder in os.listdir(self.videos_folder_full_path):
+            if "image" in video_folder:
+                os.makedirs(os.path.join(path_to_videos, video_folder), exist_ok=True)
+                # Move the video folder to the new dataset
+                video_folder_full_path = os.path.join(
+                    self.videos_folder_full_path, video_folder
+                )
+                video_files = [
+                    f for f in os.listdir(video_folder_full_path) if f.endswith(".mp4")
+                ]
+                # Sort the videos by name
+                video_files.sort()
+
+                # Move the videos from the second dataset to the new dataset and increment the index
+                for video_file in video_files:
+                    # Get the index of the video
+                    video_index = int(video_file.split("_")[-1].split(".")[0])
+                    # Rename the video file
+                    new_video_file = f"episode_{shuffle[video_index]:06d}.mp4"
+                    # Move the video file to the new dataset
+                    shutil.copy(
+                        os.path.join(video_folder_full_path, video_file),
+                        os.path.join(path_to_videos, video_folder, new_video_file),
+                    )
+
+        ### Meta files
+        logger.debug("Creating meta files")
+        os.makedirs(os.path.join(new_dataset_path, "meta"), exist_ok=True)
+
+        #### TASKS
+        logger.debug("Copying tasks.json file")
+        tasks_model = TasksModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path,
+        )
+        # No need to shuffle, just copy
+        tasks_model.save(
+            meta_folder_path=os.path.join(new_dataset_path, "meta"),
+        )
+
+        #### INFO
+        logger.debug("Copying info.json file")
+        info_model = InfoModel.from_json(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        # No need to shuffle, just copy
+        info_model.save(
+            meta_folder_path=os.path.join(new_dataset_path, "meta"),
+        )
+
+        #### EPISODES
+        logger.debug("Shuffling episodes.jsonl file")
+        episodes_model = EpisodesModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path,
+            format="lerobot_v2.1",
+        )
+        episodes_model.shuffle(
+            permutation=shuffle,
+        )
+        episodes_model.save(
+            meta_folder_path=os.path.join(new_dataset_path, "meta"),
+            save_mode="overwrite",
+        )
+
+        #### EPISODES STATS
+        logger.debug("Shuffling episodes_stats.jsonl file")
+        episodes_stats_model = EpisodesStatsModel.from_jsonl(
+            meta_folder_path=self.meta_folder_full_path,
+        )
+        episodes_stats_model.shuffle(
+            permutation=shuffle,
+        )
+        episodes_stats_model.save(
+            meta_folder_path=os.path.join(new_dataset_path, "meta"),
+        )
+
+        # Create README file
+        logger.debug("Creating README file")
+        readme_path = os.path.join(new_dataset_path, "README.md")
+        if not os.path.exists(readme_path):
+            with open(
+                readme_path,
+                "w",
+                encoding=DEFAULT_FILE_ENCODING,
+            ) as readme_file:
+                readme_file.write(self.generate_read_me_string(new_dataset_name))
+
 
 class Stats(BaseModel):
     """
@@ -1952,7 +2319,7 @@ class Stats(BaseModel):
             # Set the min to the min in each channel
             self.min = np.minimum(self.min, image_min_pixel)
             # Reshape to have the same shape as the mean and std
-            self.min = self.min.reshape(3, 1, 1)
+            self.min = self.min.reshape(3, 1, 1) if self.min is not None else self.min
 
         # Update the rolling sum and square sum
         nb_pixels = image_norm_32.shape[0] * image_norm_32.shape[1]
@@ -2645,6 +3012,39 @@ class EpisodesStatsModel(BaseModel):
         # Save the merged model
         self.save(meta_folder_path)
 
+    def split(self, split_ratio: float):
+        """
+        Splits the episodes stats model into two parts.
+        The first part contains the first split_ratio * len(episodes_stats) episodes.
+        The second part contains the rest of the episodes.
+        """
+        split_index = int(len(self.episodes_stats) * split_ratio)
+        first_part = EpisodesStatsModel(
+            episodes_stats=self.episodes_stats[:split_index]
+        )
+        second_part = EpisodesStatsModel(
+            episodes_stats=self.episodes_stats[split_index:]
+        )
+
+        # Reindex the second part
+        for episode_stats in second_part.episodes_stats:
+            episode_stats.episode_index -= len(first_part.episodes_stats)
+
+        return first_part, second_part
+
+    def shuffle(self, permutation: List[int] | np.ndarray) -> None:
+        """
+        Shuffles the episodes stats model according to the given permutation.
+        The permutation is a list of indices that specifies the new order of the episodes.
+        """
+        if len(permutation) != len(self.episodes_stats):
+            raise ValueError("Permutation length must match the number of episodes.")
+
+        self.episodes_stats = [self.episodes_stats[i] for i in permutation]
+        # Update episode_index
+        for new_index, episode_stats in enumerate(self.episodes_stats):
+            episode_stats.episode_index = new_index
+
 
 class FeatureDetails(BaseModel):
     dtype: Literal["video", "int64", "float32", "str", "bool"]
@@ -2828,10 +3228,10 @@ class InfoModel(BaseModel):
         From a robot configuration, create the appropriate InfoModel.
         This is because it depends on the number of joints etc.
         """
-        robot_info = robots[0].get_info()
+        robot_info = robots[0].get_info_for_dataset()
         if len(robots) > 1:
             for robot in robots[1:]:
-                new_info = robot.get_info()
+                new_info = robot.get_info_for_dataset()
                 robot_info = robot_info.merge_base_robot_info(new_info)
 
         features = InfoFeatures(
@@ -3270,6 +3670,64 @@ class TasksModel(BaseModel):
 
         return old_index_to_new_index, new_number_of_tasks
 
+    def split(self, split_ratio: float, initial_episodes_model: "EpisodesModel"):
+        """
+        Splits the tasks model into two parts.
+        The first part contains the first split_ratio * len(tasks) tasks.
+        The second part contains the rest of the tasks.
+        """
+        split_index = int(len(initial_episodes_model.episodes) * split_ratio)
+
+        first_tasks = TasksModel(tasks=[])
+        second_tasks = TasksModel(tasks=[])
+        mapping_old_to_new_index: dict[int, int] = {}
+
+        for episode in initial_episodes_model.episodes:
+            if episode.episode_index < split_index:
+                if episode.tasks[0] not in [
+                    first_tasks.tasks[i].task for i in range(len(first_tasks.tasks))
+                ]:
+                    first_tasks.tasks.append(
+                        TasksFeatures(
+                            task_index=len(first_tasks.tasks), task=episode.tasks[0]
+                        )
+                    )
+            else:
+                if episode.tasks[0] not in [
+                    second_tasks.tasks[i].task for i in range(len(second_tasks.tasks))
+                ]:
+                    second_tasks.tasks.append(
+                        TasksFeatures(
+                            task_index=len(second_tasks.tasks), task=episode.tasks[0]
+                        )
+                    )
+                    # Find the previous task index in the initial tasks model
+                    task_index = [
+                        task.task_index
+                        for task in self.tasks
+                        if task.task == episode.tasks[0]
+                    ]
+                    if task_index:
+                        mapping_old_to_new_index[task_index[0]] = len(
+                            mapping_old_to_new_index
+                        )
+                    else:
+                        raise ValueError(
+                            f"Task {episode.tasks[0]} not found in the initial tasks model"
+                        )
+
+        # Count the number of different tasks in the first part
+        nbr_tasks_first_part = len(first_tasks.tasks)
+        nbr_tasks_second_part = len(second_tasks.tasks)
+
+        return (
+            first_tasks,
+            second_tasks,
+            nbr_tasks_first_part,
+            nbr_tasks_second_part,
+            mapping_old_to_new_index,
+        )
+
 
 class EpisodesFeatures(BaseModel):
     """
@@ -3279,6 +3737,16 @@ class EpisodesFeatures(BaseModel):
     episode_index: int = 0
     tasks: List[str] = []
     length: int = 0
+
+    # Import tasks as a list of str if it is a str
+    @field_validator("tasks", mode="before")
+    def validate_tasks(cls, v):
+        if isinstance(v, str):
+            return [v]
+        elif isinstance(v, list):
+            return v
+        else:
+            raise ValueError("tasks must be a list of strings or a single string")
 
 
 class EpisodesModel(BaseModel):
@@ -3494,3 +3962,74 @@ class EpisodesModel(BaseModel):
 
         # Save the episodes.jsonl file
         self.to_jsonl(meta_folder_path=meta_folder_to_save_to, save_mode="overwrite")
+
+    @classmethod
+    def repair_parquets(self, parquets_path: str) -> bool:
+        """
+        This function will attempt to correct the parquet files in the dataset.
+        It will:
+        - Check if the parquets are correctly indexed
+        - Rewrite all episode_index, frame index and index
+        """
+        # Check if the parquets exist
+        if not os.path.exists(parquets_path):
+            logger.warning(f"Parquet path {parquets_path} does not exist.")
+            return False
+        # Fetch all the parquet files
+        parquet_files = os.listdir(parquets_path)
+        parquet_files = [file for file in parquet_files if file.endswith(".parquet")]
+        parquet_files.sort()
+        # Check if the files are correctly indexed
+        for i, file in enumerate(parquet_files):
+            # Check if the file is correctly indexed
+            if f"episode_{i:06d}.parquet" not in file:
+                logger.warning(
+                    f"Parquet file {file} is not correctly indexed. Expected episode_{i:06d}.parquet"
+                )
+                return False
+
+        logger.info("Parquet files are correctly indexed. Will attempt to repair them.")
+        cumulative_index = 0
+        for i, file in enumerate(parquet_files):
+            # Read the parquet file
+            df = pd.read_parquet(os.path.join(parquets_path, file))
+            # Check if the episode_index is correct
+            df["episode_index"] = i
+            df["frame_index"] = np.arange(len(df))
+            df["index"] = np.arange(len(df)) + cumulative_index
+            cumulative_index += len(df)
+            # Save the parquet file
+            df.to_parquet(os.path.join(parquets_path, file), index=False)
+            logger.info(f"Parquet file {file} repaired.")
+
+        return True
+
+    def split(self, split_ratio: float):
+        """
+        Split the episodes model into two parts.
+        """
+        # Calculate the split index
+        split_index = int(len(self.episodes) * split_ratio)
+        # Split the episodes
+        first_part = self.episodes[:split_index]
+        second_part = self.episodes[split_index:]
+        # Reindex second part
+        for i, episode in enumerate(second_part):
+            episode.episode_index = episode.episode_index - len(first_part)
+        # Create new episodes models
+        first_part_model = EpisodesModel(episodes=first_part)
+        second_part_model = EpisodesModel(episodes=second_part)
+        return first_part_model, second_part_model
+
+    def shuffle(self, permutation: List[int] | np.ndarray) -> None:
+        """
+        Shuffle the episodes in the model.
+        """
+        # Edit the episode indexes based on the permutation
+        for i, episode in enumerate(self.episodes):
+            episode.episode_index = permutation[i]
+        self.episodes.sort(key=lambda x: x.episode_index)
+        # Recreate the _episodes_features dict
+        self._episodes_features = {
+            episode.episode_index: episode for episode in self.episodes
+        }

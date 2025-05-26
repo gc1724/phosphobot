@@ -1,6 +1,6 @@
 [project]
 name = "phosphobot"
-version = "0.3.6"
+version = "0.3.19"
 description = "The AI-ready robotics dev kit, with built-in remote control and VLA support."
 authors = [{ name = "phospho", email = "contact@phospho.ai" }]
 license = "MIT"
@@ -12,7 +12,7 @@ dependencies = [
     "loguru>=0.7.2",
     "rich>=13.9.4",
     "matplotlib>=3.9.3",
-    "numpy<2",
+    "numpy",
     "pybullet>=3.2.7",
     "pydantic>=2.10.2",
     "scipy>=1.14.1",
@@ -35,7 +35,7 @@ dependencies = [
     "supabase>=2.15.0",
     "zmq>=0.0.0",
     "toml>=0.10.2",
-    "av>=14.3.0",
+    "av>=12.0.0",
     "tyro>=0.9.20",
     "types-toml>=0.10.8.20240310",
     "pyrealsense2>=2.54; platform_system == 'Linux'",
@@ -43,6 +43,11 @@ dependencies = [
     "pyrealsense2-macosx>=2.54; platform_system == 'Darwin'",
     "fastparquet>=2024.11.0",
     "httpx>=0.28.1",
+    "go2-webrtc-connect>=0.1.2",
+    "scapy>=2.6.1",
+    "netifaces>=0.11.0",
+    "wasmtime>=33.0.0",
+    "async-property>=0.2.2",
 ]
 
 [dependency-groups]
@@ -59,15 +64,19 @@ dev = [
     "pytest-xdist>=3.6.1",
     "pytest-asyncio>=0.25.1",
     "pytest-dependency>=0.6.0",
+    "types-python-dateutil>=2.9.0.20250516",
 ]
+
 
 [tool.uv]
 default-groups = ["dev"]
+
 
 [tool.uv.sources]
 # We are cloning from our fork instead of the original repo (https://github.com/Physical-Intelligence/openpi) 
 # because we had the error unknow host: github.com
 openpi-client = { git = "https://github.com/phospho-app/openpi.git", subdirectory = "packages/openpi-client", rev = "main" }
+# go2-webrtc-connect = { path = "../../go2_webrtc_connect", editable = true }
 
 
 [project.scripts]

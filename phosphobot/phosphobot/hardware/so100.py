@@ -8,23 +8,19 @@ from loguru import logger
 from phosphobot.control_signal import ControlSignal
 from serial.tools.list_ports_common import ListPortInfo
 
-from phosphobot.hardware.base import BaseRobot
+from phosphobot.hardware.base import BaseManipulator
 from phosphobot.hardware.motors.feetech import FeetechMotorsBus  # type: ignore
 from phosphobot.utils import step_simulation, get_resources_path
 
 
-class SO100Hardware(BaseRobot):
+class SO100Hardware(BaseManipulator):
     name = "so-100"
 
     URDF_FILE_PATH = str(
         get_resources_path() / "urdf" / "so-100" / "urdf" / "so-100.urdf"
     )
 
-    DEVICE_PID: int = 21971
-
     AXIS_ORIENTATION = [0, 0, 1, 1]
-
-    REGISTERED_SERIAL_ID = ["58CD176683"]
 
     # Control commands (refer to the Feetech SCServo manual)
     TORQUE_ENABLE = 0x01
@@ -86,40 +82,25 @@ class SO100Hardware(BaseRobot):
         Detect if the device is a SO-100 robot.π
         """
         # The Feetech UART board CH340 has PID 29987
-        if port.pid == cls.DEVICE_PID or port.pid == 29987:
+        if port.pid == 21971 or port.pid == 29987:
             # The serial number is not always available
             serial_number = port.serial_number or "no_serial"
             robot = cls(device_name=port.device, serial_id=serial_number)
-            # Check if voltage is not None
-            voltages = []
-            for servo_id in robot.SERVO_IDS:
-                voltage = robot.read_motor_voltage(servo_id)
-                if voltage is not None and voltage > 0:
-                    voltages.append(voltage)
-                else:
-                    logger.warning(
-                        f"Robot {robot.name} has voltage {voltage} in servo {servo_id}. Please plug the robot to power and check cable connections."
-                    )
-                    robot_ports_without_power = kwargs.get("robot_ports_without_power")
-                    if isinstance(robot_ports_without_power, set):
-                        robot_ports_without_power.add(port.device)
-
-                    return None
             return robot
         return None
 
-    def connect(self):
+    async def connect(self):
         """
         Connect to the robot.
         """
-        if not hasattr(self, "DEVICE_NAME"):
+        if not hasattr(self, "device_name"):
             logger.warning(
-                "Can't connect: no plugged robot detected (no DEVICE_NAME). Please plug the robot, then restart the server."
+                "Can't connect: no plugged robot detected (no device_name). Please plug the robot, then restart the server."
             )
             return
 
         # Create serial connection
-        self.motors_bus = FeetechMotorsBus(port=self.DEVICE_NAME, motors=self.motors)
+        self.motors_bus = FeetechMotorsBus(port=self.device_name, motors=self.motors)
         self.motors_bus.connect()
         self.is_connected = True
 
@@ -148,6 +129,13 @@ class SO100Hardware(BaseRobot):
             logger.warning(f"Error enabling torque: {e}")
             self.update_motor_errors()
             return
+
+    def disable_torque(self):
+        # Disable torque
+        if not self.is_connected:
+            return
+
+        self.motors_bus.write("Torque_Enable", 0)
 
     def _set_pid_gains_motors(
         self, servo_id: int, p_gain: int = 32, i_gain: int = 0, d_gain: int = 32
@@ -189,13 +177,6 @@ class SO100Hardware(BaseRobot):
             logger.warning(
                 "Motors torque is disabled. Motors must have torque enabled to change PID coefficients. Enable torque first."
             )
-
-    def disable_torque(self):
-        # Disable torque
-        if not self.is_connected:
-            return
-
-        self.motors_bus.write("Torque_Enable", 0)
 
     def update_motor_errors(self):
         """
@@ -399,7 +380,7 @@ class SO100Hardware(BaseRobot):
             start_time = time.time()
 
             # Get leader's current joint positions
-            pos_rad = self.current_position(unit="rad")
+            pos_rad = self.read_joints_position(unit="rad")
 
             # Update PyBullet simulation for gravity calculation
             for i, idx in enumerate(joint_indices):

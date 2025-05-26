@@ -1,17 +1,15 @@
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from phosphobot._version import __version__
 from phosphobot.types import VideoCodecs
+from phosphobot.utils import NetworkDevice
 
 from .camera import AllCamerasStatus, SingleCameraStatus
 from .dataset import (
-    BaseRobot,
-    BaseRobotConfig,
     BaseRobotInfo,
-    BaseRobotPIDGains,
     Dataset,
     Episode,
     EpisodesFeatures,
@@ -31,15 +29,7 @@ from .dataset import (
     VideoFeatureDetails,
     VideoInfo,
 )
-
-
-class RobotConfigStatus(BaseModel):
-    """
-    Contains the configuration of a robot.
-    """
-
-    name: str
-    usb_port: str | None
+from .robot import BaseRobot, BaseRobotConfig, BaseRobotPIDGains, RobotConfigStatus
 
 
 class ServerStatus(BaseModel):
@@ -101,9 +91,9 @@ class MoveAbsoluteRequest(BaseModel):
     that you get by calling /move/init.
     """
 
-    x: float = Field(description="X position in centimeters")
-    y: float = Field(description="Y position in centimeters")
-    z: float = Field(description="Z position in centimeters")
+    x: float | None = Field(None, description="X position in centimeters")
+    y: float | None = Field(None, description="Y position in centimeters")
+    z: float | None = Field(None, description="Z position in centimeters")
     rx: float | None = Field(
         None,
         description="Absolute Pitch in degrees. If None, inverse kinematics will be used to calculate the best position.",
@@ -116,7 +106,7 @@ class MoveAbsoluteRequest(BaseModel):
         None,
         description="Absolute Roll in degrees. If None, inverse kinematics will be used to calculate the best position.",
     )
-    open: float = Field(description="0 for closed, 1 for open")
+    open: float | None = Field(None, description="0 for closed, 1 for open")
 
     max_trials: int = Field(
         10,
@@ -233,13 +223,15 @@ class RelativeEndEffectorPosition(BaseModel):
     # Dataset are in RDLS format like the Bridge Data V2 dataset
     # See https://github.com/google-research/rlds for more information
 
-    x: float = Field(description="Delta X position in centimeters")
-    y: float = Field(description="Delta Y position in centimeters")
-    z: float = Field(description="Delta Z position in centimeters")
-    rx: float = Field(description="Relative Pitch in degrees")
-    ry: float = Field(description="Relative Yaw in degrees")
-    rz: float = Field(description="Relative Roll in degrees")
-    open: float
+    x: float | None = Field(None, description="Delta X position in centimeters")
+    y: float | None = Field(None, description="Delta Y position in centimeters")
+    z: float | None = Field(None, description="Delta Z position in centimeters")
+    rx: float | None = Field(None, description="Relative Pitch in degrees")
+    ry: float | None = Field(None, description="Relative Yaw in degrees")
+    rz: float | None = Field(None, description="Relative Roll in degrees")
+    open: float | None = Field(
+        None, description="0 for closed, 1 for open. If None, use the last value."
+    )
 
     def init(self, np_array: np.ndarray) -> None:
         if np_array.shape != (7,):
@@ -300,6 +292,21 @@ class CalibrateResponse(BaseModel):
     total_nb_steps: int
 
 
+class JointsReadRequest(BaseModel):
+    """
+    Request to read the joints of the robot.
+    """
+
+    unit: Literal["rad", "motor_units", "degrees"] = Field(
+        "rad",
+        description="The unit of the angles. Defaults to radian.",
+    )
+    joints_ids: List[int] | None = Field(
+        None,
+        description="If set, only read the joints with these ids. If None, read all joints.",
+    )
+
+
 class JointsWriteRequest(BaseModel):
     """
     Request to set the joints of the robot.
@@ -325,13 +332,13 @@ class JointsReadResponse(BaseModel):
     Response to read the joints of the robot.
     """
 
-    angles_rad: List[float] = Field(
+    angles: List[float | None] = Field(
         ...,
-        description="A list of length 6, with the position of each joint in radian.",
+        description="A list of length 6, with the position of each joint in the unit specified in the request. If a joint is not available, its value will be None.",
     )
-    angles_motor_units: List[int] = Field(
-        ...,
-        description="A list of length 6, with the position of each joint in motor units.",
+    unit: Literal["rad", "motor_units", "degrees"] = Field(
+        "rad",
+        description="The unit of the angles. Defaults to radian.",
     )
 
 
@@ -381,6 +388,17 @@ class StatusResponse(BaseModel):
     message: str | None = None
 
 
+class TrainingInfoRequest(BaseModel):
+    model_id: str = Field(..., description="Hugging Face model id to get training info")
+    model_type: Literal["gr00t", "ACT", "custom"]
+
+
+class TrainingInfoResponse(BaseModel):
+    status: Literal["ok", "error"]
+    message: str | None = None
+    training_body: dict | None = None
+
+
 class ServerInfoResponse(BaseModel):
     server_id: int
     url: str
@@ -388,6 +406,50 @@ class ServerInfoResponse(BaseModel):
     tcp_socket: tuple[str, int]
     model_id: str
     timeout: int
+
+
+class HFDownloadDatasetRequest(BaseModel):
+    dataset_name: str
+
+
+class DatasetRepairRequest(BaseModel):
+    dataset_path: str = Field(
+        ...,
+        description="Path to the dataset to repair",
+        examples=["/lerobot_v2.1/example_dataset"],
+    )
+
+
+class DatasetSplitRequest(BaseModel):
+    dataset_path: str = Field(
+        ...,
+        description="Path to the dataset to split",
+        examples=["/lerobot_v2.1/example_dataset"],
+    )
+    split_ratio: float = Field(
+        0.8,
+        ge=0,
+        le=1,
+        description="Ratio of the dataset to use for the first split. The second split will use the rest of the dataset.",
+    )
+    first_split_name: str = Field(
+        ...,
+        description="Name of the first split.",
+        examples=["/lerobot_v2.1/example_dataset_training"],
+    )
+    second_split_name: str = Field(
+        ...,
+        description="Name of the second split.",
+        examples=["/lerobot_v2.1/example_dataset_validation"],
+    )
+
+
+class DatasetShuffleRequest(BaseModel):
+    dataset_path: str = Field(
+        ...,
+        description="Path to the dataset to shuffle",
+        examples=["/lerobot_v2.1/example_dataset"],
+    )
 
 
 class SpawnStatusResponse(StatusResponse):
@@ -928,3 +990,72 @@ class TrainingConfig(BaseModel):
 class UDPServerInformationResponse(BaseModel):
     host: str
     port: int
+
+
+class CustomTrainingRequest(BaseModel):
+    custom_command: str = Field(
+        ...,
+        description="Will run this custom command as a subprocess when pressing the train button.",
+    )
+
+
+class ScanNetworkRequest(BaseModel):
+    """
+    Request to scan the network for devices.
+    """
+
+    robot_name: str | None = Field(
+        None,
+        description="Name of the robot to scan for. If None, scans for all devices on the network.",
+    )
+
+
+class ScanNetworkResponse(BaseModel):
+    """
+    Response to the network scan request.
+    """
+
+    devices: List[NetworkDevice] = Field(
+        ...,
+        description="List of devices found on the network.",
+    )
+    subnet: str | None = Field(
+        ...,
+        description="Subnet of the network.",
+        examples=["192.168.1.1/24"],
+    )
+
+
+class LocalDevice(BaseModel):
+    name: str
+    device: str
+    serial_number: str | None = None
+    pid: int | None = None
+    interface: str | None = None
+
+
+class ScanDevicesResponse(BaseModel):
+    """
+    Response to the USB devices scan request.
+    """
+
+    devices: List[LocalDevice] = Field(
+        ...,
+        description="List of connected USB devices.",
+    )
+
+
+class RobotConnectionRequest(BaseModel):
+    """
+    Request to manually connect to a robot.
+    """
+
+    robot_name: str = Field(
+        ...,
+        description="Type of the robot to connect to.",
+        examples=["so-100", "wx-250s", "koch-v1.1"],
+    )
+    connection_details: dict[str, Any] = Field(
+        ...,
+        description="Connection details for the robot. These are passed to the class constructor. This can include IP address, port, and other connection parameters.",
+    )

@@ -1,8 +1,9 @@
-from functools import lru_cache
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from functools import lru_cache
+from typing import Any, List, Set
 
+from async_property import async_property
 import pybullet as p  # type: ignore
 from fastapi import HTTPException
 from loguru import logger
@@ -13,15 +14,27 @@ from phosphobot.configs import config
 from phosphobot.hardware import (
     BaseRobot,
     KochHardware,
+    LeKiwi,
     PiperHardware,
     SO100Hardware,
-    SO100LeaderHardware,
+    UnitreeGo2,
     WX250SHardware,
+    RemotePhosphobot,
 )
 from phosphobot.models import RobotConfigStatus
 from phosphobot.utils import is_can_plugged
 
 rcm = None
+
+robot_name_to_class = {
+    SO100Hardware.name: SO100Hardware,
+    KochHardware.name: KochHardware,
+    WX250SHardware.name: WX250SHardware,
+    UnitreeGo2.name: UnitreeGo2,
+    LeKiwi.name: LeKiwi,
+    PiperHardware.name: PiperHardware,
+    RemotePhosphobot.name: RemotePhosphobot,
+}
 
 
 @dataclass
@@ -34,9 +47,8 @@ class NewAndOldPorts:
 
 class RobotConnectionManager:
     _all_robots: list[BaseRobot]
-    _leader_robot: Optional[BaseRobot]
+    _manually_added_robots: list[BaseRobot]
 
-    robot_ports_without_power: Set[str]
     available_ports: List[ListPortInfo]
     available_can_ports: List[str]
     last_scan_time: float
@@ -44,11 +56,10 @@ class RobotConnectionManager:
     def __init__(self):
         self.available_ports = []
         self.available_can_ports = []
-        self.robot_ports_without_power = set()
         self.last_scan_time = 0
 
         self._all_robots = []
-        self._leader_robot = None
+        self._manually_added_robots = []
 
     def __del__(self):
         # Disconnect all robots
@@ -59,12 +70,6 @@ class RobotConnectionManager:
         """
         Scan USB and CAN ports.
         """
-        # if os.name == "nt":  # Windows
-        #     # List COM ports using pyserial
-        #     ports = [port for port in list_ports.comports()]
-        # else:  # Linux/macOS
-        #     # List /dev/tty* ports for Unix-based systems
-        #     # ports = [str(path) for path in Path("/dev").glob("tty*")]
 
         available_ports = list_ports.comports()
 
@@ -116,7 +121,7 @@ class RobotConnectionManager:
             old_can_ports=list(old_can_ports_difference),
         )
 
-    def _find_robots(self) -> None:
+    async def _find_robots(self) -> None:
         """
         Loop through all available ports and try to connect to a robot.
 
@@ -132,13 +137,24 @@ class RobotConnectionManager:
             self._all_robots = [SO100Hardware(only_simulation=True)]
             return
 
-        # Enumerate the ports and try to detect a robot
+        # Keep track of connected devices by port name and serial to avoid duplicates
+        connected_devices: Set[str] = set()
+        connected_serials: Set[str] = set()
+
+        # Try each serial port exactly once
         for port in self.available_ports:
+            serial_num = getattr(port, "serial_number", None)
+            # Skip if this port or its serial has already been connected
+            if port.device in connected_devices or (
+                serial_num and serial_num in connected_serials
+            ):
+                logger.debug(f"Skipping {port.device}: already connected (or alias).")
+                continue
+
             for robot_class in [
                 WX250SHardware,
                 KochHardware,
                 SO100Hardware,
-                SO100LeaderHardware,
             ]:
                 if not hasattr(robot_class, "name") or not hasattr(
                     robot_class, "from_port"
@@ -148,30 +164,47 @@ class RobotConnectionManager:
                 logger.debug(
                     f"Trying to connect to {robot_class.name} on {port.device}."
                 )
-                robot = robot_class.from_port(
-                    port, robot_ports_without_power=self.robot_ports_without_power
-                )
+                robot = robot_class.from_port(port)
+                if robot is None:
+                    logger.debug(
+                        f"Failed to create robot from {robot_class.name} on {port.device}."
+                    )
+                    continue
+                logger.debug(f"Robot created: {robot}")
+                await robot.connect()
+
                 if robot is not None:
                     logger.success(f"Connected to {robot_class.name} on {port.device}.")
-                    # Remove from robot_ports_without_power if it was there
-                    if port.device in self.robot_ports_without_power:
-                        self.robot_ports_without_power.remove(port.device)
                     self._all_robots.append(robot)
-                    break
+                    # Mark both device and serial as connected
+                    connected_devices.add(port.device)
+                    if serial_num:
+                        connected_serials.add(serial_num)
+                    break  # stop trying other classes on this port
 
         # Detect CAN-based Agilex Piper robots
         for can_name in self.available_can_ports:
             logger.info(f"Attempting to connect to Agilex Piper on {can_name}")
-            robot = PiperHardware.from_can_port(can_name=can_name)
+            try:
+                robot = PiperHardware.from_can_port(can_name=can_name)
+                await robot.connect()
+            except Exception as e:
+                logger.warning(
+                    f"Error connecting to Agilex Piper on {can_name}: {e}. Skipping."
+                )
+                continue
             if robot is not None:
                 self._all_robots.append(robot)
                 logger.success(f"Connected to Agilex Piper on {can_name}")
 
+        # Add manually added robots
+        self._all_robots.extend(self._manually_added_robots)
+
         if not self._all_robots:
             logger.info("No robot connected.")
 
-    @property
-    def robots(self) -> list[BaseRobot]:
+    @async_property
+    async def robots(self) -> list[BaseRobot]:
         """
         Return all connected robots.
         """
@@ -180,7 +213,7 @@ class RobotConnectionManager:
         if config.ONLY_SIMULATION:
             if self._all_robots:
                 return self._all_robots
-            self._find_robots()
+            await self._find_robots()
             return self._all_robots
 
         # If we are not in simulation, we check the ports
@@ -197,19 +230,18 @@ class RobotConnectionManager:
                 or difference.old_ports
                 or difference.new_can_ports
                 or difference.old_can_ports
-                or self.robot_ports_without_power
             ):
                 # First, disconnect all robots
                 for robot in self._all_robots:
                     robot.disconnect()
                 self.available_ports = ports
                 self.available_can_ports = can_ports
-                self._find_robots()
+                await self._find_robots()
 
         # Return the stored list of robots
         return self._all_robots
 
-    def get_robot(self, robot_id: int = 0) -> BaseRobot:
+    async def get_robot(self, robot_id: int = 0) -> BaseRobot:
         """
         Return the currently connected robot.
         """
@@ -221,7 +253,7 @@ class RobotConnectionManager:
         if self._all_robots and len(self._all_robots) > robot_id:
             return self._all_robots[robot_id]
 
-        robots = self.robots
+        robots = await self.robots
         if robot_id >= len(robots):
             raise HTTPException(
                 status_code=400,
@@ -243,22 +275,32 @@ class RobotConnectionManager:
 
         return self._all_robots.index(robot)
 
-    def status(self) -> list[RobotConfigStatus]:
+    async def status(self) -> list[RobotConfigStatus]:
         """
         Return the status of all robots. Used at server startup
         """
-        robots_status = [robot.status() for robot in self.robots]
-        # If a robot returned None, we disconnect it
-        for status, robot in zip(robots_status, self.robots):
-            if status is None:
-                logger.warning(f"Robot {robot.name} is not connected. Disconnecting.")
-                if hasattr(robot, "DEVICE_NAME") and robot.DEVICE_NAME is not None:
-                    self.robot_ports_without_power.add(robot.DEVICE_NAME)
-
-                robot.disconnect()
-                self._all_robots.remove(robot)
-
+        robots_status = [robot.status() for robot in await self.robots]
         return [status for status in robots_status if status is not None]
+
+    async def add_connection(self, robot_name: str, connection_details: dict[str, Any]):
+        """
+        Manually add a connection to a robot using the robot type and connection details.
+        Useful when detecting the robot is more complex than just a serial port.
+        Eg: IP address, etc.
+        """
+        robot_class = robot_name_to_class.get(robot_name)
+        if robot_class is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Robot {robot_name} not supported. Supported robots: {list(robot_name_to_class.keys())}",
+            )
+        robot = robot_class(**connection_details)
+        await robot.connect()
+        self._all_robots.append(robot)
+        self._manually_added_robots.append(robot)
+        logger.success(
+            f"Connected to {robot.name} with robot_id {len(self._all_robots) - 1}."
+        )
 
 
 @lru_cache()

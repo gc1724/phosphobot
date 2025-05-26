@@ -1,9 +1,14 @@
+import asyncio
 import base64
 import functools
 import inspect
+import ipaddress
 import json
 import os
+import platform
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import traceback
@@ -14,6 +19,7 @@ from typing import Annotated, Any, Literal, Tuple, Union
 
 import av
 import cv2
+import netifaces
 import numpy as np
 import pandas as pd
 import requests
@@ -21,9 +27,13 @@ import toml
 from fastapi import HTTPException
 from huggingface_hub import HfApi, login
 from loguru import logger
-from pydantic import BeforeValidator, PlainSerializer
+from pydantic import BaseModel, BeforeValidator, PlainSerializer
+
 
 from phosphobot.types import VideoCodecs
+
+# Disable pyav logs
+av.logging.set_level(None)
 
 
 def is_running_on_pi() -> bool:
@@ -314,6 +324,7 @@ def is_can_plugged(interface: str = "can0") -> bool:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=3,
             )
             return "does not exist" not in result.stdout.lower()
         elif sys.platform == "darwin":
@@ -323,6 +334,7 @@ def is_can_plugged(interface: str = "can0") -> bool:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=3,
             )
             return "does not exist" not in result.stdout.lower()
         # Adds windows support
@@ -333,6 +345,7 @@ def is_can_plugged(interface: str = "can0") -> bool:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=3,
             )
             if result.stdout is None:
                 return False
@@ -344,10 +357,11 @@ def is_can_plugged(interface: str = "can0") -> bool:
         if e.returncode == 1:
             return False
         logger.error(f"Failed to check CAN interface status: {str(e)}")
-        return False
     except FileNotFoundError as e:
         logger.error(f"OSError: Required system command not found: {str(e)}")
-        return False
+    except OSError as e:
+        logger.warning(f"OSError: {str(e)}")
+    return False
 
 
 def sanitize_path(path: str) -> str:
@@ -551,10 +565,11 @@ def create_video_file(
         )  # type: ignore
         # Force a minimum bitrate for mpeg4 to avoid artifacts
         if codec_av == "mpeg4":
-            stream.bit_rate = 5_000_000  # ~5 Mb/s
+            # ~5 Mb/s
+            stream.bit_rate = 5_000_000  # type: ignore
 
-        stream.width, stream.height = size
-        stream.pix_fmt = "yuv420p"
+        stream.width, stream.height = size  # type: ignore
+        stream.pix_fmt = "yuv420p"  # type: ignore
         return container, stream
 
     def process_and_encode(frame: np.ndarray, stream, container, size: Tuple[int, int]):
@@ -860,3 +875,183 @@ def background_task_log_exceptions(func):
         return async_wrapper
     else:
         return sync_wrapper
+
+
+def get_local_network_ip():
+    # Connect to a public IP to get the IP used by the current network interface
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Google's DNS server
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return ip
+
+
+def get_local_subnet() -> str | None:
+    """
+    Get the local subnet in CIDR notation.
+    Returns:
+        str: The local subnet in CIDR notation (e.g., "192.168.1.0/24").
+        None: If no valid subnet is found.
+    """
+    for iface in netifaces.interfaces():
+        addrs = netifaces.ifaddresses(iface)
+        if netifaces.AF_INET in addrs:
+            for addr_info in addrs[netifaces.AF_INET]:
+                ip = addr_info.get("addr")
+                netmask = addr_info.get("netmask")
+                if ip and netmask and not ip.startswith("127."):
+                    network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+                    return str(network)
+    return None
+
+
+class NetworkDevice(BaseModel):
+    ip: str
+    mac: str
+
+
+async def scan_network_devices(
+    subnet: str, timeout: float = 0.5, max_workers: int = 64
+) -> list[NetworkDevice]:
+    """
+    Asynchronously scan the local network for active IPs and MAC addresses.
+    Uses ARP requests to detect devices on the network. Requires root for fast scan.
+    Falls back to slow scan with ping/ARP table parsing if not root.
+    """
+
+    async def fast_arp_scan() -> list[NetworkDevice]:
+        """Perform async fast ARP scan using scapy in a thread"""
+        from scapy.all import ARP, Ether, srp  # type: ignore
+
+        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+        arp = ARP(pdst=subnet)
+        packet = ether / arp
+
+        try:
+            # Run blocking scapy function in a thread
+            answered, _ = await asyncio.to_thread(
+                srp, packet, timeout=timeout, verbose=False
+            )
+        except Exception as e:
+            logger.debug(f"Fast scan failed: {e}")
+            raise
+
+        return [
+            NetworkDevice(
+                ip=received.psrc, mac=received.hwsrc.lower().replace("-", ":")
+            )
+            for _, received in answered
+        ]
+
+    async def slow_arp_scan() -> list[NetworkDevice]:
+        """Async implementation of slow scan using parallel pings"""
+        ip_net = ipaddress.ip_network(subnet, strict=False)
+        is_windows = platform.system().lower() == "windows"
+        semaphore = asyncio.Semaphore(max_workers)
+
+        # Before trying to call 'arp', check if it's available
+        arp_cmd = "arp.exe" if is_windows else "arp"
+        if not shutil.which(arp_cmd):
+            logger.warning(
+                f"'{arp_cmd}' command not found. ARP scan will fail. Please ensure 'arp' is installed and available in PATH. Skipping ARP scan."
+            )
+            return []
+
+        async def ping_ip(ip_str: str) -> None:
+            async with semaphore:
+                try:
+                    if is_windows:
+                        proc = await asyncio.create_subprocess_shell(
+                            f"ping -n 1 -w {int(timeout * 1000)} {ip_str}",
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                    else:
+                        proc = await asyncio.create_subprocess_exec(
+                            "ping",
+                            "-c",
+                            "1",
+                            "-W",
+                            str(int(timeout)),
+                            ip_str,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                    await asyncio.wait_for(proc.wait(), timeout=timeout + 1)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+        # Run all pings concurrently
+        logger.debug(f"Pinging {ip_net.num_addresses} IPs with {max_workers} workers")
+        await asyncio.gather(*[ping_ip(str(ip)) for ip in ip_net.hosts()])
+
+        # Read ARP table asynchronously
+        try:
+            if is_windows:
+                # Try to force UTF-8 output, fallback to system encoding
+                cmd = (
+                    "chcp 65001 > NUL && arp -a"  # Force UTF-8 code page
+                    if os.getenv("TERM")
+                    == "xterm-256color"  # Check for modern terminal
+                    else "arp -a"
+                )
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "arp",
+                    "-a",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+            stdout, _ = await proc.communicate()
+
+            if is_windows:
+                # Windows-specific decoding with type-safe check
+                try:
+                    output = stdout.decode("utf-8")
+                except UnicodeDecodeError:
+                    try:
+                        # Type-guarded Windows codepage detection
+                        from ctypes import windll  # type: ignore[attr-defined]
+
+                        codepage = windll.kernel32.GetConsoleOutputCP()
+                        output = stdout.decode(f"cp{codepage}")
+                    except (AttributeError, UnicodeDecodeError):
+                        # Final fallback to system encoding
+                        output = stdout.decode(errors="replace")
+            else:
+                output = stdout.decode()
+
+            pattern = re.compile(
+                r"(\d+\.\d+\.\d+\.\d+)\s+([\w-]+)\s+dynamic"
+                if is_windows
+                else r"\(([\d.]+)\) at ([0-9a-f:]{17})",
+                re.IGNORECASE,
+            )
+
+            return [
+                NetworkDevice(ip=ip, mac=mac.lower().replace("-", ":"))
+                for ip, mac in pattern.findall(output)
+            ]
+        except Exception as e:
+            logger.error(f"ARP table read failed: {e}")
+            return []
+
+    try:
+        return await fast_arp_scan()
+    except PermissionError:
+        logger.warning(
+            "Permission denied for fast scan. Use sudo for faster results.\n"
+            "Falling back to slow scan..."
+        )
+        return await slow_arp_scan()
+    except Exception as e:
+        logger.warning(f"Fast scan failed: {e}. Falling back to slow scan...")
+        return await slow_arp_scan()
